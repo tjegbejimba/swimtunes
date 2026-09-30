@@ -1,0 +1,3 @@
+# Unofficial extraction is not an official download entitlement
+
+Use a bundled, version-pinned yt-dlp/ffmpeg pair for user-initiated extraction of publicly accessible YouTube and SoundCloud links; browsing and search are deferred. This avoids dependence on accounts or embedded credentials and reuses one extraction path for videos, tracks, and explicitly selected playlist items, but site changes can break it and YouTube's normal terms restrict third-party downloads. The app must neither represent any arbitrary search result as authorized for download nor turn extraction failures into success-shaped transfers.

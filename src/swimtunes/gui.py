@@ -28,12 +28,17 @@ def _build_main_window():
         def __init__(self, workflow: Workflow | None = None) -> None:
             super().__init__()
             self.workflow = workflow or Workflow()
-            self.headphones_folder: Path | None = None
+            selection = self.workflow.settings.load_headphones_folder()
+            self.headphones_folder: Path | None = selection.path if selection else None
             self.setWindowTitle("SwimTunes")
 
             self.url_input = QLineEdit()
             self.url_input.setPlaceholderText("Paste one public YouTube URL")
-            self.folder_label = QLabel("No Headphones Folder selected")
+            self.folder_label = QLabel(
+                str(self.headphones_folder)
+                if self.headphones_folder
+                else "No Headphones Folder selected"
+            )
             choose_button = QPushButton("Choose Headphones Folder")
             choose_button.clicked.connect(self.choose_headphones_folder)
             transfer_button = QPushButton("Transfer")
@@ -58,14 +63,19 @@ def _build_main_window():
         def choose_headphones_folder(self) -> None:
             selected = QFileDialog.getExistingDirectory(self, "Choose Headphones Folder")
             if selected:
-                self.headphones_folder = Path(selected)
-                self.folder_label.setText(selected)
+                result = self.workflow.choose_headphones_folder(Path(selected))
+                if result.ok:
+                    self.headphones_folder = Path(selected)
+                    self.folder_label.setText(selected)
+                    self.output.setPlainText("Headphones Folder selected.")
+                else:
+                    self.output.setPlainText(result.outcomes[0].message)
 
         def transfer(self) -> None:
             if self.headphones_folder is None:
                 self.output.setPlainText("Choose a Headphones Folder before starting.")
                 return
-            result = self.workflow.transfer_one(self.url_input.text(), self.headphones_folder)
+            result = self.workflow.transfer_one(self.url_input.text())
             lines = []
             for outcome in result.outcomes:
                 if outcome.status is TransferStatus.TRANSFERRED:

@@ -6,6 +6,7 @@ on:
       - main
       - tjegbejimba-ubiquitous-robot
       - t11
+      - t13
   pull_request:
 
 jobs:
@@ -99,18 +100,43 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          uv run pyinstaller --noconfirm --clean --name SwimTunes --onedir --windowed --hidden-import PySide6.QtWidgets --add-data 'build/windows/tools;tools' src/swimtunes/gui.py
-          Copy-Item docs/third-party.md dist/SwimTunes/THIRD_PARTY_NOTICES.md
-          Copy-Item build/windows/tools/TOOL_MANIFEST.json dist/SwimTunes/TOOL_MANIFEST.json
+          $version = (uv run python -c "import swimtunes; print(swimtunes.__version__)").Trim()
+          uv run pyinstaller --noconfirm --clean --name SwimTunes --onedir --windowed --hidden-import PySide6.QtWidgets --add-data 'build/windows/tools;tools' --distpath build/windows/app-dist src/swimtunes/gui.py
+          uv run pyinstaller --noconfirm --clean --name SwimTunes --onefile --windowed --distpath build/windows/launcher-dist src/swimtunes/launcher.py
+
+          $portable = 'dist/SwimTunesPortable'
+          $versionRoot = Join-Path $portable "versions/$version"
+          New-Item -ItemType Directory -Force $versionRoot | Out-Null
+          Copy-Item build/windows/app-dist/SwimTunes (Join-Path $versionRoot 'SwimTunes') -Recurse
+          Copy-Item build/windows/launcher-dist/SwimTunes.exe (Join-Path $portable 'SwimTunes.exe')
+          Copy-Item docs/third-party.md (Join-Path $portable 'THIRD_PARTY_NOTICES.md')
+          Copy-Item docs/third-party.md (Join-Path $versionRoot 'SwimTunes/THIRD_PARTY_NOTICES.md')
+          Copy-Item build/windows/tools/TOOL_MANIFEST.json (Join-Path $versionRoot 'SwimTunes/TOOL_MANIFEST.json')
+
+          @{ version = $version } | ConvertTo-Json -Compress | Set-Content -Encoding UTF8 (Join-Path $portable 'current.json')
+          [ordered]@{
+            version = $version
+            artifact = 'ci-internal-build'
+            sha256 = 'ci-internal-build'
+            publisher = 'CI test publisher'
+            executable = 'SwimTunes/SwimTunes.exe'
+          } | ConvertTo-Json -Depth 4 | Set-Content -Encoding UTF8 (Join-Path $versionRoot 'UPDATE_VERIFIED.json')
+          Set-Content -Encoding UTF8 (Join-Path $versionRoot 'INSTALL_COMPLETE') 'ok'
       - name: Smoke launch bundle self-check
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $process = Start-Process -FilePath dist/SwimTunes/SwimTunes.exe -ArgumentList '--self-check' -Wait -PassThru
+          $env:PATH = ''
+          $process = Start-Process -FilePath dist/SwimTunesPortable/SwimTunes.exe -ArgumentList '--self-check' -Wait -PassThru
           if ($process.ExitCode -ne 0) { throw "SwimTunes self-check failed with $($process.ExitCode)" }
+      - name: Run portable updater scenarios
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          uv run pytest tests/test_portable_update_installer.py -q
       - name: Upload internal portable artifact
         uses: actions/upload-artifact@v4
         with:
           name: SwimTunes-windows-x64-portable-internal
-          path: dist/SwimTunes
+          path: dist/SwimTunesPortable
           if-no-files-found: error

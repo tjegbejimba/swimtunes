@@ -1,6 +1,6 @@
 # SwimTunes
 
-SwimTunes is a planned desktop app for putting audio from public YouTube and SoundCloud links onto filesystem-mounted swim headphones. This private repository currently holds the [domain glossary](CONTEXT.md) and [architecture decisions](docs/adr/); the app has not been implemented. The old `~/SwimTunes` PowerShell files are reference material, not the app.
+SwimTunes is a planned desktop app for putting audio from public YouTube and SoundCloud links onto filesystem-mounted swim headphones. This private repository currently holds the [domain glossary](GLOSSARY.md) and [architecture decisions](docs/adr/); the app has not been implemented. The old `~/SwimTunes` PowerShell files are reference material, not the app.
 
 ## Locked v1 scope
 

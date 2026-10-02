@@ -37,6 +37,7 @@ class AudioFile:
 
 
 class TransferStatus(Enum):
+    DOWNLOADED = "downloaded"
     TRANSFERRED = "transferred"
     ERROR = "error"
 
@@ -46,6 +47,7 @@ class TransferOutcome:
     status: TransferStatus
     title: str | None = None
     source_url: str | None = None
+    audio_path: Path | None = None
     transfer_path: Path | None = None
     message: str = ""
 

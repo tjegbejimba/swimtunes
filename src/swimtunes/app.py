@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+from collections.abc import Callable, Iterable
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from swimtunes.adapters.ffmpeg import FfmpegMediaAdapter
 from swimtunes.adapters.filesystem import LocalFilesystemAdapter
 from swimtunes.adapters.ytdlp import YtDlpExtractor
-from swimtunes.models import OperationResult, TransferOutcome, TransferStatus
+from swimtunes.models import OperationResult, SourceItem, TransferOutcome, TransferStatus
 from swimtunes.paths import default_workspace
 from swimtunes.ports import Encoder, Extractor, FileSystem
+
+ProgressCallback = Callable[[TransferOutcome], None]
+SourceInput = str | SourceItem
 
 
 class Workflow:
@@ -25,26 +29,43 @@ class Workflow:
         self.workspace = workspace or default_workspace()
 
     def transfer_one(self, url: str, headphones_folder: Path) -> OperationResult:
-        url = url.strip()
+        return self.run([url], headphones_folder)
+
+    def run(
+        self,
+        items: Iterable[SourceInput],
+        headphones_folder: Path,
+        on_progress: ProgressCallback | None = None,
+    ) -> OperationResult:
+        outcomes: list[TransferOutcome] = []
+        for item in items:
+            outcomes.append(self._process_one(item, headphones_folder, on_progress))
+        return OperationResult(outcomes)
+
+    def _process_one(
+        self,
+        item: SourceInput,
+        headphones_folder: Path,
+        on_progress: ProgressCallback | None,
+    ) -> TransferOutcome:
+        url = self._source_url(item).strip()
         if not self._is_supported_public_url(url):
-            return OperationResult([
-                TransferOutcome(
-                    status=TransferStatus.ERROR,
-                    source_url=url,
-                    message="Enter a public YouTube or SoundCloud URL.",
-                )
-            ])
+            return TransferOutcome(
+                status=TransferStatus.ERROR,
+                title=item.title if isinstance(item, SourceItem) else None,
+                source_url=url,
+                message="Enter a public YouTube or SoundCloud URL.",
+            )
 
         try:
             self.filesystem.ensure_headphones_folder(headphones_folder)
         except Exception as exc:
-            return OperationResult([
-                TransferOutcome(
-                    status=TransferStatus.ERROR,
-                    source_url=url,
-                    message=str(exc),
-                )
-            ])
+            return TransferOutcome(
+                status=TransferStatus.ERROR,
+                title=item.title if isinstance(item, SourceItem) else None,
+                source_url=url,
+                message=str(exc),
+            )
 
         try:
             self.workspace.mkdir(parents=True, exist_ok=True)
@@ -54,46 +75,58 @@ class Workflow:
             audio_path.parent.mkdir(parents=True, exist_ok=True)
             media_info = self.encoder.encode_mp3(extracted_path, audio_path)
             if not media_info.is_stereo_192kbps_mp3:
-                return OperationResult([
-                    TransferOutcome(
-                        status=TransferStatus.ERROR,
-                        title=source_item.title,
-                        source_url=url,
-                        message="Audio File is not a stereo 192 kbps MP3.",
-                    )
-                ])
-            probed_info = self.encoder.probe(audio_path)
-            if not probed_info.is_stereo_192kbps_mp3:
-                return OperationResult([
-                    TransferOutcome(
-                        status=TransferStatus.ERROR,
-                        title=source_item.title,
-                        source_url=url,
-                        message="Encoded Audio File failed artifact verification.",
-                    )
-                ])
-            transfer_path = self.filesystem.transfer_verified(audio_path, headphones_folder, filename)
-            return OperationResult([
-                TransferOutcome(
-                    status=TransferStatus.TRANSFERRED,
+                return TransferOutcome(
+                    status=TransferStatus.ERROR,
                     title=source_item.title,
                     source_url=url,
-                    transfer_path=transfer_path,
-                    message="Transferred",
+                    message="Audio File is not a stereo 192 kbps MP3.",
                 )
-            ])
+            probed_info = self.encoder.probe(audio_path)
+            if not probed_info.is_stereo_192kbps_mp3:
+                return TransferOutcome(
+                    status=TransferStatus.ERROR,
+                    title=source_item.title,
+                    source_url=url,
+                    audio_path=audio_path,
+                    message="Encoded Audio File failed artifact verification.",
+                )
+            downloaded = TransferOutcome(
+                status=TransferStatus.DOWNLOADED,
+                title=source_item.title,
+                source_url=url,
+                audio_path=audio_path,
+                message="Downloaded Audio File",
+            )
+            if on_progress is not None:
+                on_progress(downloaded)
+            transfer_path = self.filesystem.transfer_verified(audio_path, headphones_folder, filename)
+            transferred = TransferOutcome(
+                status=TransferStatus.TRANSFERRED,
+                title=source_item.title,
+                source_url=url,
+                audio_path=audio_path,
+                transfer_path=transfer_path,
+                message="Transferred",
+            )
+            if on_progress is not None:
+                on_progress(transferred)
+            return transferred
         except Exception as exc:
             title = locals().get("source_item").title if "source_item" in locals() else None
             if "filename" in locals():
                 self._remove_incomplete_transfer_artifacts(headphones_folder, locals()["filename"])
-            return OperationResult([
-                TransferOutcome(
-                    status=TransferStatus.ERROR,
-                    title=title,
-                    source_url=url,
-                    message=str(exc),
-                )
-            ])
+            return TransferOutcome(
+                status=TransferStatus.ERROR,
+                title=title,
+                source_url=url,
+                audio_path=locals().get("audio_path"),
+                message=str(exc),
+            )
+
+    def _source_url(self, item: SourceInput) -> str:
+        if isinstance(item, SourceItem):
+            return item.url
+        return item
 
     def _is_supported_public_url(self, url: str) -> bool:
         parsed = urlparse(url)
@@ -104,6 +137,9 @@ class Workflow:
             return bool(parsed.path.strip("/"))
         if host in {"youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com"}:
             return parsed.path == "/watch" and bool(parse_qs(parsed.query).get("v"))
+        if host in {"soundcloud.com", "www.soundcloud.com"}:
+            parts = [part for part in parsed.path.split("/") if part]
+            return len(parts) >= 2 and parts[0] != "sets"
         return False
 
     def _remove_incomplete_transfer_artifacts(self, headphones_folder: Path, filename: str) -> None:

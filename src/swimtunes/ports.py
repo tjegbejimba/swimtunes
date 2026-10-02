@@ -6,6 +6,7 @@ from typing import Protocol
 from swimtunes.models import (
     HeadphonesDeviceIdentity,
     HeadphonesFolderSelection,
+    LocalLibrarySettings,
     MediaInfo,
     SourceItem,
     SourcePlaylist,
@@ -72,3 +73,9 @@ class SettingsStore(Protocol):
 
     def save_headphones_folder(self, selection: HeadphonesFolderSelection) -> None:
         """Persist the remembered Headphones Folder selection."""
+
+    def load_local_library(self) -> LocalLibrarySettings:
+        """Load keep-local and the selected Local Library."""
+
+    def save_local_library(self, settings: LocalLibrarySettings) -> None:
+        """Persist keep-local and the selected Local Library."""

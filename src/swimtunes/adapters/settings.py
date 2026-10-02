@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from swimtunes.models import HeadphonesDeviceIdentity, HeadphonesFolderSelection
+from swimtunes.models import HeadphonesDeviceIdentity, HeadphonesFolderSelection, LocalLibrarySettings
 from swimtunes.paths import default_settings_path
 
 
@@ -40,6 +40,30 @@ class JsonSettingsStore:
                 "kind": selection.device_identity.kind,
                 "stable_id": selection.device_identity.stable_id,
             },
+        }
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+
+    def load_local_library(self) -> LocalLibrarySettings:
+        if not self.path.exists():
+            return LocalLibrarySettings()
+        data = self._load_raw()
+        local_library = data.get("local_library")
+        if not isinstance(local_library, dict):
+            return LocalLibrarySettings()
+        enabled = bool(local_library.get("enabled", False))
+        path = local_library.get("path")
+        if not enabled:
+            return LocalLibrarySettings(enabled=False, path=None)
+        if not isinstance(path, str):
+            return LocalLibrarySettings(enabled=True, path=None)
+        return LocalLibrarySettings(enabled=True, path=Path(path))
+
+    def save_local_library(self, settings: LocalLibrarySettings) -> None:
+        data = self._load_raw()
+        data["local_library"] = {
+            "enabled": settings.enabled,
+            "path": str(settings.path) if settings.path is not None else None,
         }
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")

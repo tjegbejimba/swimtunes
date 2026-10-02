@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import sys
 import inspect
+import subprocess
 from pathlib import Path
 
 from swimtunes.app import SimpleCancelToken, Workflow
 from swimtunes.models import SelectionSpaceSummary, TransferStatus
 from swimtunes.tools import self_check
 from swimtunes.update import UpdateCheckStatus, default_update_checker
+from swimtunes.update.installer import default_portable_layout, install_update_at_startup
 
 
 class MainWindow:  # populated at runtime after PySide6 import succeeds
@@ -151,10 +153,35 @@ def _build_main_window():
             result = self.update_checker.check()
             if result.status is UpdateCheckStatus.WARNING and result.warning:
                 self.output.setPlainText(f"Update warning: {result.warning}")
-            elif result.status is UpdateCheckStatus.ELIGIBLE and result.candidate is not None:
+                return
+            if result.status is not UpdateCheckStatus.ELIGIBLE or result.candidate is None:
+                return
+            layout = default_portable_layout()
+            if layout is None:
                 self.output.setPlainText(
-                    f"Update available: SwimTunes {result.candidate.version} is verified and ready to install."
+                    f"Update available: SwimTunes {result.candidate.version} is verified; portable layout was not detected."
                 )
+                return
+            install_result = install_update_at_startup(layout=layout, update_result=result)
+            if install_result.installed:
+                self.output.setPlainText(f"Update installed: SwimTunes {install_result.version}; relaunching.")
+                self._relaunch_from_launcher(layout.root)
+            elif install_result.warning:
+                self.output.setPlainText(f"Update warning: {install_result.warning}")
+
+        def _relaunch_from_launcher(self, portable_root: Path) -> None:
+            launcher = portable_root / "SwimTunes.exe"
+            if not launcher.is_file():
+                self.output.setPlainText(
+                    f"Update installed, but launcher was not found at {launcher}. Please restart SwimTunes."
+                )
+                return
+            subprocess.Popen([str(launcher)])
+            from PySide6.QtWidgets import QApplication
+
+            app = QApplication.instance()
+            if app is not None:
+                app.quit()
 
         def choose_headphones_folder(self) -> None:
             selected = QFileDialog.getExistingDirectory(self, "Choose Headphones Folder")

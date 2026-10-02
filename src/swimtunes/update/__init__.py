@@ -80,6 +80,7 @@ class UpdateCheckResult:
     status: UpdateCheckStatus
     candidate: UpdateCandidate | None = None
     warning: str | None = None
+    artifact: ReleaseArtifact | None = None
 
 
 @dataclass(frozen=True)
@@ -205,7 +206,7 @@ class UpdateChecker:
                     f"Update artifact publisher '{publisher}' is not the trusted publisher "
                     f"'{self.config.expected_publisher}'; continuing current version."
                 )
-            return UpdateCheckResult(UpdateCheckStatus.ELIGIBLE, candidate=candidate)
+            return UpdateCheckResult(UpdateCheckStatus.ELIGIBLE, candidate=candidate, artifact=artifact)
         except NoUpdateAvailable:
             return UpdateCheckResult(UpdateCheckStatus.NO_UPDATE)
         except FeedUnavailable as exc:

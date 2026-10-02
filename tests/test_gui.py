@@ -9,6 +9,7 @@ from swimtunes.models import (
     TransferRecord,
     TransferStatus,
 )
+from swimtunes.update import UpdateCheckResult, UpdateCheckStatus
 
 
 class FakeWorkflow:
@@ -57,6 +58,33 @@ def wait_for_transfer(window, app, timeout_ms: int = 2000) -> None:
         time.sleep(0.01)
     app.processEvents()
     assert window.active_thread is None
+
+
+def test_gui_runs_startup_update_check_and_shows_visible_warning(monkeypatch) -> None:
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+    from swimtunes.gui import _build_main_window
+
+    app = QApplication.instance() or QApplication([])
+
+    class WarningUpdateChecker:
+        def __init__(self) -> None:
+            self.checked = False
+
+        def check(self):
+            self.checked = True
+            return UpdateCheckResult(
+                status=UpdateCheckStatus.WARNING,
+                warning="Update check failed: network is unreachable; continuing current version.",
+            )
+
+    update_checker = WarningUpdateChecker()
+    window = _build_main_window()(FakeWorkflow(), update_checker=update_checker)
+
+    assert update_checker.checked is True
+    assert "Update warning: Update check failed" in window.output.toPlainText()
+    window.close()
+    app.processEvents()
 
 
 def test_gui_accepts_multiline_input_and_shows_per_item_status(

@@ -7,6 +7,7 @@ from pathlib import Path
 from swimtunes.app import SimpleCancelToken, Workflow
 from swimtunes.models import SelectionSpaceSummary, TransferStatus
 from swimtunes.tools import self_check
+from swimtunes.update import UpdateCheckStatus, default_update_checker
 
 
 class MainWindow:  # populated at runtime after PySide6 import succeeds
@@ -47,9 +48,10 @@ def _build_main_window():
             self.finished.emit(result)
 
     class SwimTunesWindow(QMainWindow):
-        def __init__(self, workflow: Workflow | None = None) -> None:
+        def __init__(self, workflow: Workflow | None = None, update_checker=None) -> None:
             super().__init__()
             self.workflow = workflow or Workflow()
+            self.update_checker = update_checker if update_checker is not None else default_update_checker()
             selection = None
             settings = getattr(self.workflow, "settings", None)
             if settings is not None:
@@ -139,8 +141,20 @@ def _build_main_window():
             container = QWidget()
             container.setLayout(layout)
             self.setCentralWidget(container)
+            self._run_startup_update_check()
             self._refresh_pending_transfers()
             self._refresh_local_library_audio()
+
+        def _run_startup_update_check(self) -> None:
+            if self.update_checker is None:
+                return
+            result = self.update_checker.check()
+            if result.status is UpdateCheckStatus.WARNING and result.warning:
+                self.output.setPlainText(f"Update warning: {result.warning}")
+            elif result.status is UpdateCheckStatus.ELIGIBLE and result.candidate is not None:
+                self.output.setPlainText(
+                    f"Update available: SwimTunes {result.candidate.version} is verified and ready to install."
+                )
 
         def choose_headphones_folder(self) -> None:
             selected = QFileDialog.getExistingDirectory(self, "Choose Headphones Folder")

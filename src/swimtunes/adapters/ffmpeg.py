@@ -5,6 +5,7 @@ import subprocess
 from pathlib import Path
 
 from swimtunes.models import MediaInfo
+from swimtunes.tools import bundled_root, resolve_required_tools
 
 
 _BITRATES_KBPS = {
@@ -20,9 +21,10 @@ _SAMPLE_RATES = {
 
 
 class FfmpegMediaAdapter:
-    def __init__(self, ffmpeg: str = "ffmpeg", ffprobe: str = "ffprobe") -> None:
-        self.ffmpeg = ffmpeg
-        self.ffprobe = ffprobe
+    def __init__(self, ffmpeg: str | Path | None = None, ffprobe: str | Path | None = None) -> None:
+        tools = resolve_required_tools(bundle_root=bundled_root()) if ffmpeg is None or ffprobe is None else None
+        self.ffmpeg = str(ffmpeg or tools.ffmpeg)
+        self.ffprobe = str(ffprobe or tools.ffprobe)
 
     def encode_mp3(self, source_media: Path, output_path: Path) -> MediaInfo:
         output_path.parent.mkdir(parents=True, exist_ok=True)

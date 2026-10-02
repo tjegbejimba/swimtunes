@@ -10,7 +10,14 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from swimtunes.launcher import COMPLETE_MARKER, DEFAULT_EXECUTABLE, POINTER_FILE, PREVIOUS_POINTER_FILE, VERIFICATION_RECORD
-from swimtunes.update import ReleaseArtifact, UpdateCandidate, UpdateCheckResult, UpdateCheckStatus
+from swimtunes.update import (
+    PublisherVerifier,
+    ReleaseArtifact,
+    UpdateCandidate,
+    UpdateCheckResult,
+    UpdateCheckStatus,
+    WindowsAuthenticodePublisherVerifier,
+)
 
 
 @dataclass(frozen=True)
@@ -55,8 +62,9 @@ class PortableLayout:
 
 
 class PortableUpdateInstaller:
-    def __init__(self, layout: PortableLayout) -> None:
+    def __init__(self, layout: PortableLayout, publisher_verifier: PublisherVerifier | None = None) -> None:
         self.layout = layout
+        self.publisher_verifier = publisher_verifier
 
     def install(self, candidate: UpdateCandidate, artifact: ReleaseArtifact) -> PortableInstallOutcome:
         try:
@@ -83,6 +91,10 @@ class PortableUpdateInstaller:
             if not executable.is_file():
                 shutil.rmtree(staging, ignore_errors=True)
                 return _warn("Staged update did not contain SwimTunes.exe; continuing current version.")
+            publisher_warning = self._verify_staged_publishers(staging, candidate.publisher)
+            if publisher_warning is not None:
+                shutil.rmtree(staging, ignore_errors=True)
+                return _warn(publisher_warning)
 
             record = {
                 "version": candidate.version,
@@ -110,11 +122,34 @@ class PortableUpdateInstaller:
         except (OSError, zipfile.BadZipFile, ValueError) as exc:
             return _warn(f"Update installation failed: {exc}; continuing current version.")
 
+    def _verify_staged_publishers(self, staging: Path, expected_publisher: str) -> str | None:
+        if self.publisher_verifier is None:
+            return None
+        pe_files = sorted(
+            path
+            for path in staging.rglob("*")
+            if path.is_file() and path.suffix.lower() in {".exe", ".dll"}
+        )
+        if not pe_files:
+            return "Staged update did not contain signed executable files; continuing current version."
+        for path in pe_files:
+            trusted, publisher = self.publisher_verifier.verify(
+                ReleaseArtifact(name=path.name, path=path),
+                expected_publisher,
+            )
+            if not trusted:
+                return (
+                    f"Staged update publisher '{publisher}' on {path.name} is not the trusted "
+                    f"publisher '{expected_publisher}'; continuing current version."
+                )
+        return None
+
 
 def install_update_at_startup(
     *,
     layout: PortableLayout,
     update_result: UpdateCheckResult,
+    publisher_verifier: PublisherVerifier | None = None,
 ) -> PortableInstallOutcome:
     if update_result.status is UpdateCheckStatus.WARNING:
         return _warn(update_result.warning or "Update check failed; continuing current version.")
@@ -123,7 +158,8 @@ def install_update_at_startup(
     artifact = getattr(update_result, "artifact", None)
     if artifact is None:
         return _warn("Update was verified but no staged artifact was available; continuing current version.")
-    return PortableUpdateInstaller(layout).install(update_result.candidate, artifact)
+    verifier = publisher_verifier or WindowsAuthenticodePublisherVerifier()
+    return PortableUpdateInstaller(layout, publisher_verifier=verifier).install(update_result.candidate, artifact)
 
 
 def default_portable_layout(executable: Path | None = None) -> PortableLayout | None:

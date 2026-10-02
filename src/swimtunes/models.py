@@ -116,6 +116,31 @@ class TransferStatus(Enum):
     ERROR = "error"
 
 
+class SettingsStatus(Enum):
+    SAVED = "saved"
+    DISABLED = "disabled"
+    ERROR = "error"
+
+
+@dataclass(frozen=True)
+class SettingsOutcome:
+    status: SettingsStatus
+    path: Path | None = None
+    message: str = ""
+
+
+@dataclass(frozen=True)
+class SettingsResult:
+    outcomes: list[SettingsOutcome]
+
+    @property
+    def ok(self) -> bool:
+        return bool(self.outcomes) and all(
+            outcome.status in {SettingsStatus.SAVED, SettingsStatus.DISABLED}
+            for outcome in self.outcomes
+        )
+
+
 @dataclass(frozen=True)
 class TransferOutcome:
     status: TransferStatus

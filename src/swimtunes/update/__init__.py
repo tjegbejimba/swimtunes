@@ -198,15 +198,6 @@ class UpdateChecker:
             digest = hashlib.sha256(artifact.bytes()).hexdigest()
             if digest.lower() != candidate.sha256.lower():
                 return _warning("Update artifact hash did not match signed metadata; continuing current version.")
-            trusted, publisher = self.publisher_verifier.verify(
-                artifact,
-                self.config.expected_publisher,
-            )
-            if not trusted:
-                return _warning(
-                    f"Update artifact publisher '{publisher}' is not the trusted publisher "
-                    f"'{self.config.expected_publisher}'; continuing current version."
-                )
             return UpdateCheckResult(UpdateCheckStatus.ELIGIBLE, candidate=candidate, artifact=artifact)
         except NoUpdateAvailable:
             return UpdateCheckResult(UpdateCheckStatus.NO_UPDATE)

@@ -8,6 +8,7 @@ on:
       - t11
       - t13
       - t14
+      - review-fixes
   pull_request:
 
 jobs:

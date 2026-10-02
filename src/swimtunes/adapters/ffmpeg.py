@@ -87,11 +87,12 @@ class FfmpegMediaAdapter:
         data = path.read_bytes()
         offset = self._skip_id3v2(data)
         bitrates: list[int] = []
+        channels_seen: list[int] = []
         first_frame_start: int | None = None
         first_frame_channels: int | None = None
         first_frame_version: str | None = None
 
-        while offset + 4 <= len(data) and len(bitrates) < 200:
+        while offset + 4 <= len(data):
             header = int.from_bytes(data[offset : offset + 4], "big")
             parsed = self._parse_mp3_frame_header(header)
             if parsed is None:
@@ -103,13 +104,14 @@ class FfmpegMediaAdapter:
                 first_frame_channels = channels
                 first_frame_version = version
             bitrates.append(bitrate)
+            channels_seen.append(channels)
             offset += frame_size
 
         if not bitrates or first_frame_start is None:
             return False
         if self._has_vbr_header(data, first_frame_start, first_frame_version, first_frame_channels):
             return False
-        return len(set(bitrates)) == 1
+        return len(set(bitrates)) == 1 and bitrates[0] == 192_000 and set(channels_seen) == {2}
 
     def _skip_id3v2(self, data: bytes) -> int:
         if len(data) < 10 or data[:3] != b"ID3":

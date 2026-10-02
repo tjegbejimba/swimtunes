@@ -34,11 +34,18 @@ class MacOSDeviceIdentityAdapter:
             )
             data = plistlib.loads(completed.stdout)
         except Exception:
-            return None
+            return self._stat_device_identity(folder)
         stable_id = data.get("VolumeUUID") or data.get("MediaUUID")
         if not stable_id:
-            return None
+            return self._stat_device_identity(folder)
         return HeadphonesDeviceIdentity(kind="macos-volume-uuid", stable_id=str(stable_id))
+
+    def _stat_device_identity(self, folder: Path) -> HeadphonesDeviceIdentity | None:
+        try:
+            stat = folder.stat()
+        except OSError:
+            return None
+        return HeadphonesDeviceIdentity(kind="posix-device", stable_id=str(stat.st_dev))
 
     def find_folder(
         self,

@@ -34,8 +34,24 @@ class SignedFixtureFeed(ReleaseFeed):
 
 
 class TrustedPublisherVerifier:
+    def __init__(self) -> None:
+        self.checked: list[Path] = []
+
     def verify(self, artifact: ReleaseArtifact, expected_publisher: str):
+        assert artifact.path is not None
+        self.checked.append(artifact.path)
         return True, expected_publisher
+
+
+class UntrustedPublisherVerifier:
+    def __init__(self, publisher: str = "Mallory") -> None:
+        self.publisher = publisher
+        self.checked: list[Path] = []
+
+    def verify(self, artifact: ReleaseArtifact, expected_publisher: str):
+        assert artifact.path is not None
+        self.checked.append(artifact.path)
+        return False, self.publisher
 
 
 def _candidate(version: str, payload: bytes) -> UpdateCandidate:
@@ -52,6 +68,7 @@ def _zip_app(artifact_dir: Path, version: str, exe_text: str = "app") -> Release
     zip_path = artifact_dir / f"candidate-{version}.zip"
     with zipfile.ZipFile(zip_path, "w") as archive:
         archive.writestr("SwimTunes/SwimTunes.exe", exe_text)
+        archive.writestr("SwimTunes/_internal/app.dll", "dll")
         archive.writestr("SwimTunes/_internal/tools/TOOL_MANIFEST.json", "{}")
     return ReleaseArtifact(name=zip_path.name, path=zip_path)
 
@@ -82,9 +99,12 @@ def test_successful_update_is_staged_verified_promoted_and_selected_by_launcher(
     artifact = _zip_app(artifact_dir, "0.2.0", "new")
     candidate = _candidate("0.2.0", artifact.bytes())
 
-    result = PortableUpdateInstaller(PortableLayout(root)).install(candidate, artifact)
+    verifier = TrustedPublisherVerifier()
+
+    result = PortableUpdateInstaller(PortableLayout(root), publisher_verifier=verifier).install(candidate, artifact)
 
     assert result.installed
+    assert {path.name for path in verifier.checked} == {"SwimTunes.exe", "app.dll"}
     assert result.warning is None
     assert (root / "previous.json").read_text(encoding="utf-8") == json.dumps({"version": "0.1.0"})
     target = choose_launch_target(root)
@@ -209,7 +229,29 @@ def test_startup_installs_candidate_from_signed_feed_fixture(artifact_dir: Path)
         publisher_verifier=TrustedPublisherVerifier(),
     ).check()
 
-    outcome = install_update_at_startup(layout=PortableLayout(root), update_result=update_result)
+    outcome = install_update_at_startup(
+        layout=PortableLayout(root),
+        update_result=update_result,
+        publisher_verifier=TrustedPublisherVerifier(),
+    )
 
     assert outcome.installed
     assert choose_launch_target(root).read_text(encoding="utf-8") == "new"
+
+
+def test_staged_executable_wrong_publisher_is_rejected_before_promotion(artifact_dir: Path) -> None:
+    root = artifact_dir / "portable"
+    old_exe = _make_installed_version(root, "0.1.0")
+    _point_current(root, "0.1.0")
+    artifact = _zip_app(artifact_dir, "0.2.0", "new")
+    candidate = _candidate("0.2.0", artifact.bytes())
+
+    result = PortableUpdateInstaller(
+        PortableLayout(root),
+        publisher_verifier=UntrustedPublisherVerifier(),
+    ).install(candidate, artifact)
+
+    assert not result.installed
+    assert "publisher 'Mallory'" in result.warning
+    assert not (root / "versions" / "0.2.0").exists()
+    assert choose_launch_target(root) == old_exe

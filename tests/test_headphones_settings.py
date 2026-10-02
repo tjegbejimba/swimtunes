@@ -2,7 +2,7 @@ from pathlib import Path
 
 from swimtunes.adapters.settings import JsonSettingsStore
 from swimtunes.app import Workflow
-from swimtunes.models import HeadphonesDeviceIdentity, MediaInfo, SourceItem, TransferStatus
+from swimtunes.models import HeadphonesDeviceIdentity, MediaInfo, SettingsStatus, SourceItem, TransferStatus
 
 
 class RecordingExtractor:
@@ -74,6 +74,7 @@ def test_chosen_headphones_folder_survives_restart_and_transfer_uses_verified_de
     first_run = _workflow(artifact_dir, devices)
     selection = first_run.choose_headphones_folder(headphones_folder)
     assert selection.ok is True
+    assert selection.outcomes[0].status is SettingsStatus.SAVED
 
     after_restart = _workflow(artifact_dir, devices)
     result = after_restart.transfer_one("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
@@ -159,3 +160,51 @@ def test_unverifiable_identity_requires_explicit_reselect_before_write(
 
     assert result.ok is True
     assert result.outcomes[0].transfer_path == new_folder / "Lane Mix--a63668cb.mp3"
+
+
+def test_first_transfer_with_explicit_folder_captures_device_identity(
+    artifact_dir: Path,
+) -> None:
+    headphones_folder = artifact_dir / "Volumes" / "SWIM" / "Music"
+    headphones_folder.mkdir(parents=True)
+    identity = HeadphonesDeviceIdentity(kind="macos-volume-uuid", stable_id="MAC-FIRST-USE")
+    settings = JsonSettingsStore(artifact_dir / "settings.json")
+    workflow = Workflow(
+        extractor=RecordingExtractor(artifact_dir / "source.webm"),
+        encoder=WritingEncoder(),
+        workspace=artifact_dir / "workspace",
+        settings=settings,
+        device_identity=SimulatedDeviceIdentities({headphones_folder: identity}),
+    )
+    (artifact_dir / "source.webm").write_bytes(b"source media")
+
+    result = workflow.transfer_one("https://www.youtube.com/watch?v=dQw4w9WgXcQ", headphones_folder)
+
+    assert result.ok is True
+    selection = settings.load_headphones_folder()
+    assert selection is not None
+    assert selection.path == headphones_folder
+    assert selection.device_identity == identity
+
+
+def test_first_transfer_with_unverifiable_explicit_folder_is_rejected_before_extraction(
+    artifact_dir: Path,
+) -> None:
+    headphones_folder = artifact_dir / "Volumes" / "SWIM" / "Music"
+    headphones_folder.mkdir(parents=True)
+    extractor = RecordingExtractor(artifact_dir / "source.webm")
+    workflow = Workflow(
+        extractor=extractor,
+        encoder=WritingEncoder(),
+        workspace=artifact_dir / "workspace",
+        settings=JsonSettingsStore(artifact_dir / "settings.json"),
+        device_identity=SimulatedDeviceIdentities({headphones_folder: None}),
+    )
+
+    result = workflow.transfer_one("https://www.youtube.com/watch?v=dQw4w9WgXcQ", headphones_folder)
+
+    assert result.ok is False
+    assert extractor.calls == []
+    assert result.outcomes[0].status is TransferStatus.ERROR
+    assert "reselect" in result.outcomes[0].message.lower()
+    assert list(headphones_folder.iterdir()) == []

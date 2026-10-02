@@ -18,6 +18,9 @@ from swimtunes.models import (
     LocalLibrarySettings,
     OperationResult,
     SelectionSpaceSummary,
+    SettingsOutcome,
+    SettingsResult,
+    SettingsStatus,
     SourceItem,
     SourcePlaylist,
     SourcePlaylistEntry,
@@ -45,6 +48,10 @@ COMPLETED_TRANSFER = "completed"
 LOCAL_TRANSFER = "local"
 ESTIMATED_AUDIO_BYTES_PER_SECOND = 24_000
 ESTIMATE_MARGIN_RATIO = 0.05
+YOUTUBE_VIDEO = "youtube_video"
+YOUTUBE_PLAYLIST = "youtube_playlist"
+SOUNDCLOUD_TRACK = "soundcloud_track"
+SOUNDCLOUD_PLAYLIST = "soundcloud_playlist"
 
 
 class SimpleCancelToken:
@@ -73,13 +80,13 @@ class Workflow:
         self.extractor = extractor or YtDlpExtractor()
         self.encoder = encoder or FfmpegMediaAdapter()
         self.filesystem = filesystem or LocalFilesystemAdapter()
-        self.settings = settings or JsonSettingsStore()
         self.device_identity = device_identity or platform_device_identity_adapter()
         self.workspace = workspace or default_workspace()
+        self.settings = settings or JsonSettingsStore(self.workspace.parent / "settings.json")
         self.state_store = state_store or JsonTransferStateStore(self.workspace / "transfer-state.json")
         self._resolved_metadata_cache: dict[str, SourceItem] = {}
 
-    def choose_headphones_folder(self, headphones_folder: Path) -> OperationResult:
+    def choose_headphones_folder(self, headphones_folder: Path) -> SettingsResult:
         try:
             self.filesystem.ensure_headphones_folder(headphones_folder)
             identity = self.device_identity.identity_for(headphones_folder)
@@ -91,15 +98,15 @@ class Workflow:
             self.settings.save_headphones_folder(
                 HeadphonesFolderSelection(path=headphones_folder, device_identity=identity)
             )
-            return OperationResult([
-                TransferOutcome(
-                    status=TransferStatus.TRANSFERRED,
-                    transfer_path=headphones_folder,
+            return SettingsResult([
+                SettingsOutcome(
+                    status=SettingsStatus.SAVED,
+                    path=headphones_folder,
                     message="Headphones Folder selected.",
                 )
             ])
         except Exception as exc:
-            return OperationResult([TransferOutcome(status=TransferStatus.ERROR, message=str(exc))])
+            return SettingsResult([SettingsOutcome(status=SettingsStatus.ERROR, message=str(exc))])
 
     def local_library_settings(self) -> LocalLibrarySettings:
         return self.settings.load_local_library()
@@ -109,12 +116,12 @@ class Workflow:
         enabled: bool,
         local_library: Path | None,
         headphones_folder: Path | None = None,
-    ) -> OperationResult:
+    ) -> SettingsResult:
         try:
             if not enabled:
                 self.settings.save_local_library(LocalLibrarySettings(enabled=False, path=None))
-                return OperationResult(
-                    [TransferOutcome(status=TransferStatus.TRANSFERRED, message="Local Library disabled.")]
+                return SettingsResult(
+                    [SettingsOutcome(status=SettingsStatus.DISABLED, message="Local Library disabled.")]
                 )
             if local_library is None:
                 raise ValueError("Choose a Local Library before enabling keep local MP3s.")
@@ -125,11 +132,17 @@ class Workflow:
             if selected_headphones is not None and local_library.resolve() == selected_headphones.resolve():
                 raise ValueError("Choose a Local Library separate from the Headphones Folder.")
             self.settings.save_local_library(LocalLibrarySettings(enabled=True, path=local_library))
-            return OperationResult(
-                [TransferOutcome(status=TransferStatus.TRANSFERRED, message="Local Library settings saved.")]
+            return SettingsResult(
+                [
+                    SettingsOutcome(
+                        status=SettingsStatus.SAVED,
+                        path=local_library,
+                        message="Local Library settings saved.",
+                    )
+                ]
             )
         except Exception as exc:
-            return OperationResult([TransferOutcome(status=TransferStatus.ERROR, message=str(exc))])
+            return SettingsResult([SettingsOutcome(status=SettingsStatus.ERROR, message=str(exc))])
 
     def local_audio_files(self) -> list[LocalAudioFile]:
         settings = self.settings.load_local_library()
@@ -449,163 +462,26 @@ class Workflow:
         cancel_token: CancelToken | None,
     ) -> TransferOutcome:
         local_settings = self.settings.load_local_library()
-        if local_settings.enabled:
-            return self._process_one_keep_local(
-                item,
-                headphones_folder,
-                on_progress,
-                local_settings,
-                cancel_token,
-            )
-        url = self._source_url(item).strip()
-        title_hint = self._source_title(item)
-        if self._is_cancelled(cancel_token):
-            return self._cancelled_outcome(item)
-        if not self._is_supported_public_url(url):
-            return TransferOutcome(
-                status=TransferStatus.ERROR,
-                title=title_hint,
-                source_url=url,
-                message="Enter a public YouTube or SoundCloud URL.",
-            )
+        keep_local = local_settings.enabled
+        return self._process_one_pipeline(
+            item,
+            headphones_folder,
+            on_progress,
+            local_settings if keep_local else None,
+            cancel_token,
+        )
 
-        try:
-            resolved_headphones_folder = self._resolve_headphones_folder(headphones_folder)
-            self.filesystem.ensure_headphones_folder(resolved_headphones_folder)
-        except Exception as exc:
-            return TransferOutcome(
-                status=TransferStatus.ERROR,
-                title=title_hint,
-                source_url=url,
-                message=str(exc),
-            )
-
-        try:
-            self.workspace.mkdir(parents=True, exist_ok=True)
-            source_item = self._resolve_source_item(item, url)
-            if self._is_cancelled(cancel_token):
-                return self._cancelled_outcome(source_item)
-            existing = self._existing_record_outcome(
-                source_item,
-                resolved_headphones_folder,
-                on_progress=on_progress,
-                confirm_repair=False,
-            )
-            if existing is not None:
-                return existing
-
-            extracted_item, extracted_path = self._extract(url, self.workspace / "extracted", cancel_token)
-            if self._is_cancelled(cancel_token):
-                return self._cancelled_outcome(source_item)
-            source_item = SourceItem(
-                source_id=source_item.source_id,
-                url=url,
-                title=extracted_item.title or source_item.title,
-                duration_seconds=extracted_item.duration_seconds or source_item.duration_seconds,
-            )
-            filename = self._transfer_filename(source_item, resolved_headphones_folder)
-            audio_path = self._recovery_audio_path(filename)
-            audio_path.parent.mkdir(parents=True, exist_ok=True)
-            media_info = self.encoder.encode_mp3(extracted_path, audio_path)
-            if not media_info.is_stereo_192kbps_mp3:
-                return TransferOutcome(
-                    status=TransferStatus.ERROR,
-                    title=source_item.title,
-                    source_url=url,
-                    message="Audio File is not a stereo 192 kbps MP3.",
-                )
-            probed_info = self.encoder.probe(audio_path)
-            if not probed_info.is_stereo_192kbps_mp3:
-                return TransferOutcome(
-                    status=TransferStatus.ERROR,
-                    title=source_item.title,
-                    source_url=url,
-                    audio_path=audio_path,
-                    message="Encoded Audio File failed artifact verification.",
-                )
-            downloaded = TransferOutcome(
-                status=TransferStatus.DOWNLOADED,
-                title=source_item.title,
-                source_url=url,
-                audio_path=audio_path,
-                message="Downloaded Audio File",
-            )
-            if on_progress is not None:
-                on_progress(downloaded)
-            self.state_store.save(
-                TransferRecord(
-                    source_id=source_item.source_id,
-                    title=source_item.title,
-                    filename=filename,
-                    byte_size=audio_path.stat().st_size,
-                    sha256=self._sha256(audio_path),
-                    source_url=url,
-                    status=PENDING_TRANSFER,
-                )
-            )
-            if self._is_cancelled(cancel_token):
-                return self._cancelled_outcome(source_item, audio_path=audio_path)
-            transfer_path = self._transfer_verified(
-                audio_path,
-                resolved_headphones_folder,
-                filename,
-                cancel_token,
-            )
-            self.state_store.save(
-                TransferRecord(
-                    source_id=source_item.source_id,
-                    title=source_item.title,
-                    filename=transfer_path.name,
-                    byte_size=audio_path.stat().st_size,
-                    sha256=self._sha256(audio_path),
-                    source_url=url,
-                    status=COMPLETED_TRANSFER,
-                )
-            )
-            transferred = TransferOutcome(
-                status=TransferStatus.TRANSFERRED,
-                title=source_item.title,
-                source_url=url,
-                audio_path=audio_path,
-                transfer_path=transfer_path,
-                message="Transferred",
-            )
-            if on_progress is not None:
-                on_progress(transferred)
-            return transferred
-        except OperationCancelled as exc:
-            title = locals().get("source_item").title if "source_item" in locals() else title_hint
-            if "filename" in locals():
-                self._remove_incomplete_transfer_artifacts(resolved_headphones_folder, locals()["filename"])
-            return TransferOutcome(
-                status=TransferStatus.CANCELLED,
-                title=title,
-                source_url=url,
-                audio_path=locals().get("audio_path"),
-                message=str(exc) or "Cancelled.",
-            )
-        except Exception as exc:
-            title = locals().get("source_item").title if "source_item" in locals() else title_hint
-            if "filename" in locals():
-                self._remove_incomplete_transfer_artifacts(resolved_headphones_folder, locals()["filename"])
-            return TransferOutcome(
-                status=TransferStatus.ERROR,
-                title=title,
-                source_url=url,
-                audio_path=locals().get("audio_path"),
-                message=str(exc),
-            )
-
-    def _process_one_keep_local(
+    def _process_one_pipeline(
         self,
         item: SourceInput,
         headphones_folder: Path | None,
         on_progress: ProgressCallback | None,
-        local_settings: LocalLibrarySettings,
+        local_settings: LocalLibrarySettings | None,
         cancel_token: CancelToken | None,
     ) -> TransferOutcome:
         url = self._source_url(item).strip()
         title_hint = self._source_title(item)
+        keep_local = local_settings is not None
         if self._is_cancelled(cancel_token):
             return self._cancelled_outcome(item)
         if not self._is_supported_public_url(url):
@@ -617,36 +493,47 @@ class Workflow:
             )
 
         try:
-            local_library = self._require_local_library(local_settings)
+            local_library = self._require_local_library(local_settings) if keep_local else None
+            resolved_headphones_folder: Path | None = None
+            if not keep_local:
+                resolved_headphones_folder = self._resolve_headphones_folder(headphones_folder)
+                self.filesystem.ensure_headphones_folder(resolved_headphones_folder)
+
             self.workspace.mkdir(parents=True, exist_ok=True)
             source_item = self._resolve_source_item(item, url)
             if self._is_cancelled(cancel_token):
                 return self._cancelled_outcome(source_item)
-            record = self.state_store.get(source_item.source_id)
-            if record is not None:
-                audio_path = local_library / record.filename
-                if self._matches_record(audio_path, record):
-                    try:
-                        resolved_headphones_folder = self._resolve_headphones_folder(headphones_folder)
-                        self.filesystem.ensure_headphones_folder(resolved_headphones_folder)
-                    except Exception:
-                        return TransferOutcome(
-                            status=TransferStatus.DOWNLOADED,
-                            title=record.title,
-                            source_url=record.source_url or url,
-                            audio_path=audio_path,
-                            message="Downloaded Audio File",
-                        )
-                    return self._transfer_audio_record(
-                        record,
-                        audio_path,
-                        resolved_headphones_folder,
-                        on_progress=on_progress,
-                        cancel_token=cancel_token,
-                    )
 
-            filename = self._transfer_filename(source_item, local_library)
-            audio_path = local_library / filename
+            if keep_local and local_library is not None:
+                recorded = self.state_store.get(source_item.source_id)
+                if recorded is not None:
+                    audio_path = local_library / recorded.filename
+                    if self._matches_record(audio_path, recorded):
+                        return self._transfer_existing_or_downloaded_only(
+                            recorded,
+                            audio_path,
+                            headphones_folder,
+                            on_progress,
+                            cancel_token,
+                            url,
+                        )
+            elif resolved_headphones_folder is not None:
+                existing = self._existing_record_outcome(
+                    source_item,
+                    resolved_headphones_folder,
+                    on_progress=on_progress,
+                    confirm_repair=False,
+                )
+                if existing is not None:
+                    return existing
+
+            filename_base = local_library if keep_local and local_library is not None else resolved_headphones_folder
+            if filename_base is None:
+                raise ValueError("Choose a Headphones Folder before starting.")
+            filename = self._transfer_filename(source_item, filename_base)
+            audio_path = (local_library / filename) if keep_local and local_library is not None else self._recovery_audio_path(filename)
+            audio_path.parent.mkdir(parents=True, exist_ok=True)
+
             extracted_item, extracted_path = self._extract(url, self.workspace / "extracted", cancel_token)
             if self._is_cancelled(cancel_token):
                 return self._cancelled_outcome(source_item)
@@ -656,23 +543,10 @@ class Workflow:
                 title=extracted_item.title or source_item.title,
                 duration_seconds=extracted_item.duration_seconds or source_item.duration_seconds,
             )
-            media_info = self.encoder.encode_mp3(extracted_path, audio_path)
-            if not media_info.is_stereo_192kbps_mp3:
-                return TransferOutcome(
-                    status=TransferStatus.ERROR,
-                    title=source_item.title,
-                    source_url=url,
-                    message="Audio File is not a stereo 192 kbps MP3.",
-                )
-            probed_info = self.encoder.probe(audio_path)
-            if not probed_info.is_stereo_192kbps_mp3:
-                return TransferOutcome(
-                    status=TransferStatus.ERROR,
-                    title=source_item.title,
-                    source_url=url,
-                    audio_path=audio_path,
-                    message="Encoded Audio File failed artifact verification.",
-                )
+            verification_error = self._encode_and_verify_audio(extracted_path, audio_path, source_item, url)
+            if verification_error is not None:
+                return verification_error
+
             record = TransferRecord(
                 source_id=source_item.source_id,
                 title=source_item.title,
@@ -680,7 +554,7 @@ class Workflow:
                 byte_size=audio_path.stat().st_size,
                 sha256=self._sha256(audio_path),
                 source_url=url,
-                status=LOCAL_TRANSFER,
+                status=LOCAL_TRANSFER if keep_local else PENDING_TRANSFER,
             )
             self.state_store.save(record)
             downloaded = TransferOutcome(
@@ -694,11 +568,15 @@ class Workflow:
                 on_progress(downloaded)
             if self._is_cancelled(cancel_token):
                 return self._cancelled_outcome(source_item, audio_path=audio_path)
-            try:
-                resolved_headphones_folder = self._resolve_headphones_folder(headphones_folder)
-                self.filesystem.ensure_headphones_folder(resolved_headphones_folder)
-            except Exception:
-                return downloaded
+
+            if keep_local:
+                try:
+                    resolved_headphones_folder = self._resolve_headphones_folder(headphones_folder)
+                    self.filesystem.ensure_headphones_folder(resolved_headphones_folder)
+                except Exception:
+                    return downloaded
+            if resolved_headphones_folder is None:
+                raise ValueError("Choose a Headphones Folder before starting.")
             return self._transfer_audio_record(
                 record,
                 audio_path,
@@ -708,16 +586,7 @@ class Workflow:
             )
         except OperationCancelled as exc:
             title = locals().get("source_item").title if "source_item" in locals() else title_hint
-            if "resolved_headphones_folder" in locals() and "filename" in locals():
-                self._remove_incomplete_transfer_artifacts(
-                    locals()["resolved_headphones_folder"],
-                    locals()["filename"],
-                )
-            if "resolved_headphones_folder" in locals() and "record" in locals():
-                self._remove_incomplete_transfer_artifacts(
-                    locals()["resolved_headphones_folder"],
-                    locals()["record"].filename,
-                )
+            self._cleanup_pipeline_artifacts(locals())
             return TransferOutcome(
                 status=TransferStatus.CANCELLED,
                 title=title,
@@ -727,16 +596,7 @@ class Workflow:
             )
         except Exception as exc:
             title = locals().get("source_item").title if "source_item" in locals() else title_hint
-            if "resolved_headphones_folder" in locals() and "filename" in locals():
-                self._remove_incomplete_transfer_artifacts(
-                    locals()["resolved_headphones_folder"],
-                    locals()["filename"],
-                )
-            if "resolved_headphones_folder" in locals() and "record" in locals():
-                self._remove_incomplete_transfer_artifacts(
-                    locals()["resolved_headphones_folder"],
-                    locals()["record"].filename,
-                )
+            self._cleanup_pipeline_artifacts(locals())
             return TransferOutcome(
                 status=TransferStatus.ERROR,
                 title=title,
@@ -744,6 +604,71 @@ class Workflow:
                 audio_path=locals().get("audio_path"),
                 message=str(exc),
             )
+
+    def _transfer_existing_or_downloaded_only(
+        self,
+        record: TransferRecord,
+        audio_path: Path,
+        headphones_folder: Path | None,
+        on_progress: ProgressCallback | None,
+        cancel_token: CancelToken | None,
+        fallback_url: str,
+    ) -> TransferOutcome:
+        try:
+            resolved_headphones_folder = self._resolve_headphones_folder(headphones_folder)
+            self.filesystem.ensure_headphones_folder(resolved_headphones_folder)
+        except Exception:
+            return TransferOutcome(
+                status=TransferStatus.DOWNLOADED,
+                title=record.title,
+                source_url=record.source_url or fallback_url,
+                audio_path=audio_path,
+                message="Downloaded Audio File",
+            )
+        return self._transfer_audio_record(
+            record,
+            audio_path,
+            resolved_headphones_folder,
+            on_progress=on_progress,
+            cancel_token=cancel_token,
+        )
+
+    def _encode_and_verify_audio(
+        self,
+        extracted_path: Path,
+        audio_path: Path,
+        source_item: SourceItem,
+        url: str,
+    ) -> TransferOutcome | None:
+        media_info = self.encoder.encode_mp3(extracted_path, audio_path)
+        if not media_info.is_stereo_192kbps_mp3:
+            return TransferOutcome(
+                status=TransferStatus.ERROR,
+                title=source_item.title,
+                source_url=url,
+                message="Audio File is not a stereo 192 kbps MP3.",
+            )
+        probed_info = self.encoder.probe(audio_path)
+        if not probed_info.is_stereo_192kbps_mp3:
+            return TransferOutcome(
+                status=TransferStatus.ERROR,
+                title=source_item.title,
+                source_url=url,
+                audio_path=audio_path,
+                message="Encoded Audio File failed artifact verification.",
+            )
+        return None
+
+    def _cleanup_pipeline_artifacts(self, local_vars: dict[str, object]) -> None:
+        folder = local_vars.get("resolved_headphones_folder")
+        if not isinstance(folder, Path):
+            return
+        filename = local_vars.get("filename")
+        if isinstance(filename, str):
+            self._remove_incomplete_transfer_artifacts(folder, filename)
+        record = local_vars.get("record")
+        if isinstance(record, TransferRecord):
+            self._remove_incomplete_transfer_artifacts(folder, record.filename)
 
     def _source_url(self, item: SourceInput) -> str:
         if isinstance(item, SourceItem | SourcePlaylistEntry):
@@ -768,30 +693,10 @@ class Workflow:
         return self.extractor.resolve(url)
 
     def _is_supported_public_url(self, url: str) -> bool:
-        parsed = urlparse(url)
-        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-            return False
-        host = parsed.hostname.lower() if parsed.hostname else ""
-        if host == "youtu.be":
-            return bool(parsed.path.strip("/"))
-        if host in {"youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com"}:
-            return parsed.path == "/watch" and bool(parse_qs(parsed.query).get("v"))
-        if host in {"soundcloud.com", "www.soundcloud.com"}:
-            parts = [part for part in parsed.path.split("/") if part]
-            return len(parts) >= 2 and parts[1] != "sets"
-        return False
+        return _classify_source_url(url) in {YOUTUBE_VIDEO, SOUNDCLOUD_TRACK}
 
     def _is_explicit_source_playlist_url(self, url: str) -> bool:
-        parsed = urlparse(url)
-        if parsed.scheme not in {"http", "https"}:
-            return False
-        host = parsed.hostname.lower() if parsed.hostname else ""
-        if host in {"youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com"}:
-            return parsed.path == "/playlist" and bool(parse_qs(parsed.query).get("list"))
-        if host in {"soundcloud.com", "www.soundcloud.com"}:
-            parts = [part for part in parsed.path.split("/") if part]
-            return len(parts) >= 3 and parts[1] == "sets"
-        return False
+        return _classify_source_url(url) in {YOUTUBE_PLAYLIST, SOUNDCLOUD_PLAYLIST}
 
     def _remove_incomplete_transfer_artifacts(self, headphones_folder: Path, filename: str) -> None:
         for path in (
@@ -807,6 +712,15 @@ class Workflow:
         selection = self.settings.load_headphones_folder()
         if requested_folder is not None:
             if selection is None:
+                identity = self.device_identity.identity_for(requested_folder)
+                if identity is None:
+                    raise ValueError(
+                        "Headphones Device identity could not be verified; reselect a "
+                        "verifiable Headphones Folder before transferring."
+                    )
+                self.settings.save_headphones_folder(
+                    HeadphonesFolderSelection(path=requested_folder, device_identity=identity)
+                )
                 return requested_folder
             if selection.path != requested_folder:
                 raise ValueError("Reselect this Headphones Folder in settings before transferring.")
@@ -1046,3 +960,26 @@ class Workflow:
 def estimate_audio_size_bytes(duration_seconds: float) -> int:
     raw_bytes = max(0.0, duration_seconds) * ESTIMATED_AUDIO_BYTES_PER_SECOND
     return math.ceil(raw_bytes * (1 + ESTIMATE_MARGIN_RATIO))
+
+
+def _classify_source_url(url: str) -> str | None:
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return None
+    host = parsed.hostname.lower() if parsed.hostname else ""
+    if host == "youtu.be":
+        return YOUTUBE_VIDEO if parsed.path.strip("/") else None
+    if host in {"youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com"}:
+        query = parse_qs(parsed.query)
+        if parsed.path == "/watch" and query.get("v"):
+            return YOUTUBE_VIDEO
+        if parsed.path == "/playlist" and query.get("list"):
+            return YOUTUBE_PLAYLIST
+        return None
+    if host in {"soundcloud.com", "www.soundcloud.com"}:
+        parts = [part for part in parsed.path.split("/") if part]
+        if len(parts) >= 3 and parts[1] == "sets":
+            return SOUNDCLOUD_PLAYLIST
+        if len(parts) >= 2 and parts[1] != "sets":
+            return SOUNDCLOUD_TRACK
+    return None

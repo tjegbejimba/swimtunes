@@ -302,19 +302,15 @@ def _build_main_window():
             lines: list[str] = []
             transferred_labels: set[str] = set()
 
-            def record_progress(outcome) -> None:
-                label = outcome.title or outcome.source_url or "Source Item"
-                if outcome.status is TransferStatus.DOWNLOADED:
-                    lines.append(f"Downloaded: {label} -> {outcome.audio_path}")
-                    self.output.setPlainText("\n".join(lines))
-                elif outcome.status is TransferStatus.TRANSFERRED:
-                    transferred_labels.add(label)
-                    lines.append(f"Transferred: {label} -> {outcome.transfer_path}")
-                    self.output.setPlainText("\n".join(lines))
-
             lines.append(summary_line)
             self.output.setPlainText("\n".join(lines))
-            self._start_background_transfer(transfer, items, lines, transferred_labels, record_progress)
+            self._start_background_transfer(
+                transfer,
+                items,
+                lines,
+                transferred_labels,
+                lambda outcome: self._record_progress(outcome, lines, transferred_labels),
+            )
 
         def cancel_transfer(self) -> None:
             if self.cancel_token is not None:

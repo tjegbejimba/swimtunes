@@ -165,10 +165,11 @@ def test_same_older_or_older_prerelease_versions_are_rejected(signing_key, versi
     assert "is not newer than installed version" in result.warning
 
 
-def test_valid_newer_signed_update_is_eligible(signed_manifest) -> None:
+def test_valid_newer_signed_update_is_eligible_without_zip_publisher_check(signed_manifest) -> None:
     manifest, signature, public_key, artifact_bytes = signed_manifest
+    verifier = FixturePublisherVerifier(trusted=False, publisher="unsigned zip")
 
-    result = _checker(manifest, signature, public_key, artifact_bytes).check()
+    result = _checker(manifest, signature, public_key, artifact_bytes, verifier).check()
 
     assert result.status is UpdateCheckStatus.ELIGIBLE
     assert result.candidate is not None
@@ -269,12 +270,11 @@ def test_tampered_artifact_hash_is_rejected(signed_manifest) -> None:
     assert "artifact hash did not match signed metadata" in result.warning
 
 
-def test_wrong_designated_publisher_is_rejected(signed_manifest) -> None:
+def test_zip_publisher_verifier_is_not_used_before_extraction(signed_manifest) -> None:
     manifest, signature, public_key, artifact_bytes = signed_manifest
     verifier = FixturePublisherVerifier(trusted=True, publisher="Mallory")
 
     result = _checker(manifest, signature, public_key, artifact_bytes, verifier).check()
 
-    assert result.status is UpdateCheckStatus.WARNING
-    assert result.candidate is None
-    assert "artifact publisher 'Mallory' is not the trusted publisher" in result.warning
+    assert result.status is UpdateCheckStatus.ELIGIBLE
+    assert verifier.checked == []

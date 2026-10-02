@@ -73,6 +73,7 @@ class TransferStatus(Enum):
     DOWNLOADED = "downloaded"
     TRANSFERRED = "transferred"
     ALREADY_PRESENT = "already_present"
+    REPAIR_NEEDED = "repair_needed"
     ERROR = "error"
 
 
@@ -105,3 +106,5 @@ class TransferRecord:
     filename: str
     byte_size: int
     sha256: str
+    source_url: str = ""
+    status: str = "completed"

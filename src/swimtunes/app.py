@@ -26,6 +26,8 @@ from swimtunes.state import JsonTransferStateStore
 
 ProgressCallback = Callable[[TransferOutcome], None]
 SourceInput = str | SourceItem | SourcePlaylistEntry
+PENDING_TRANSFER = "pending"
+COMPLETED_TRANSFER = "completed"
 
 
 class Workflow:
@@ -71,6 +73,51 @@ class Workflow:
 
     def transfer_one(self, url: str, headphones_folder: Path | None = None) -> OperationResult:
         return self.run([url], headphones_folder)
+
+    def pending_transfers(self) -> list[TransferRecord]:
+        return [record for record in self.state_store.all() if record.status == PENDING_TRANSFER]
+
+    def retry_pending(
+        self,
+        source_id: str,
+        headphones_folder: Path | None = None,
+        on_progress: ProgressCallback | None = None,
+        confirm_repair: bool = False,
+    ) -> OperationResult:
+        record = self.state_store.get(source_id)
+        if record is None or record.status != PENDING_TRANSFER:
+            return OperationResult(
+                [
+                    TransferOutcome(
+                        status=TransferStatus.ERROR,
+                        message="No pending Transfer is available to retry.",
+                    )
+                ]
+            )
+        try:
+            resolved_headphones_folder = self._resolve_headphones_folder(headphones_folder)
+            self.filesystem.ensure_headphones_folder(resolved_headphones_folder)
+        except Exception as exc:
+            return OperationResult(
+                [
+                    TransferOutcome(
+                        status=TransferStatus.ERROR,
+                        title=record.title,
+                        source_url=record.source_url or None,
+                        message=str(exc),
+                    )
+                ]
+            )
+        return OperationResult(
+            [
+                self._transfer_recovered_audio(
+                    record,
+                    resolved_headphones_folder,
+                    on_progress=on_progress,
+                    confirm_repair=confirm_repair,
+                )
+            ]
+        )
 
     def run(
         self,
@@ -159,7 +206,12 @@ class Workflow:
         try:
             self.workspace.mkdir(parents=True, exist_ok=True)
             source_item = self._resolve_source_item(item, url)
-            existing = self._existing_record_outcome(source_item, resolved_headphones_folder)
+            existing = self._existing_record_outcome(
+                source_item,
+                resolved_headphones_folder,
+                on_progress=on_progress,
+                confirm_repair=False,
+            )
             if existing is not None:
                 return existing
 
@@ -170,7 +222,7 @@ class Workflow:
                 title=extracted_item.title or source_item.title,
             )
             filename = self._transfer_filename(source_item, resolved_headphones_folder)
-            audio_path = self.workspace / "audio" / filename
+            audio_path = self._recovery_audio_path(filename)
             audio_path.parent.mkdir(parents=True, exist_ok=True)
             media_info = self.encoder.encode_mp3(extracted_path, audio_path)
             if not media_info.is_stereo_192kbps_mp3:
@@ -198,6 +250,17 @@ class Workflow:
             )
             if on_progress is not None:
                 on_progress(downloaded)
+            self.state_store.save(
+                TransferRecord(
+                    source_id=source_item.source_id,
+                    title=source_item.title,
+                    filename=filename,
+                    byte_size=audio_path.stat().st_size,
+                    sha256=self._sha256(audio_path),
+                    source_url=url,
+                    status=PENDING_TRANSFER,
+                )
+            )
             transfer_path = self.filesystem.transfer_verified(audio_path, resolved_headphones_folder, filename)
             self.state_store.save(
                 TransferRecord(
@@ -206,6 +269,8 @@ class Workflow:
                     filename=transfer_path.name,
                     byte_size=audio_path.stat().st_size,
                     sha256=self._sha256(audio_path),
+                    source_url=url,
+                    status=COMPLETED_TRANSFER,
                 )
             )
             transferred = TransferOutcome(
@@ -317,16 +382,21 @@ class Workflow:
         self,
         source_item: SourceItem,
         headphones_folder: Path,
+        on_progress: ProgressCallback | None,
+        confirm_repair: bool,
     ) -> TransferOutcome | None:
         record = self.state_store.get(source_item.source_id)
         if record is None:
             return None
+        if record.status == PENDING_TRANSFER:
+            return self._transfer_recovered_audio(
+                record,
+                headphones_folder,
+                on_progress=on_progress,
+                confirm_repair=confirm_repair,
+            )
         transfer_path = headphones_folder / record.filename
-        if (
-            transfer_path.exists()
-            and transfer_path.stat().st_size == record.byte_size
-            and self._sha256(transfer_path) == record.sha256
-        ):
+        if self._matches_record(transfer_path, record):
             return TransferOutcome(
                 status=TransferStatus.ALREADY_PRESENT,
                 title=source_item.title,
@@ -336,13 +406,103 @@ class Workflow:
             )
         if transfer_path.exists():
             return TransferOutcome(
-                status=TransferStatus.ERROR,
+                status=TransferStatus.REPAIR_NEEDED,
                 title=source_item.title,
                 source_url=source_item.url,
                 transfer_path=transfer_path,
-                message="Existing Transfer appears damaged; repair is required before retry.",
+                message="Existing Transfer appears damaged; repair requires confirmation before retry.",
             )
         return None
+
+    def _transfer_recovered_audio(
+        self,
+        record: TransferRecord,
+        headphones_folder: Path,
+        on_progress: ProgressCallback | None,
+        confirm_repair: bool,
+    ) -> TransferOutcome:
+        audio_path = self._recovery_audio_path(record.filename)
+        transfer_path = headphones_folder / record.filename
+        if not self._matches_record(audio_path, record):
+            return TransferOutcome(
+                status=TransferStatus.ERROR,
+                title=record.title,
+                source_url=record.source_url or None,
+                audio_path=audio_path,
+                transfer_path=transfer_path,
+                message="Pending Audio File is missing or damaged; the Source Item must be downloaded again.",
+            )
+        if self._matches_record(transfer_path, record):
+            self._save_completed_record(record, transfer_path)
+            return TransferOutcome(
+                status=TransferStatus.ALREADY_PRESENT,
+                title=record.title,
+                source_url=record.source_url or None,
+                audio_path=audio_path,
+                transfer_path=transfer_path,
+                message="Already present",
+            )
+        if transfer_path.exists() and not confirm_repair:
+            return TransferOutcome(
+                status=TransferStatus.REPAIR_NEEDED,
+                title=record.title,
+                source_url=record.source_url or None,
+                audio_path=audio_path,
+                transfer_path=transfer_path,
+                message="Damaged app-owned copy requires confirmation before repair.",
+            )
+        downloaded = TransferOutcome(
+            status=TransferStatus.DOWNLOADED,
+            title=record.title,
+            source_url=record.source_url or None,
+            audio_path=audio_path,
+            message="Downloaded Audio File",
+        )
+        if on_progress is not None:
+            on_progress(downloaded)
+        try:
+            completed_path = self.filesystem.transfer_verified(audio_path, headphones_folder, record.filename)
+            self._save_completed_record(record, completed_path)
+            transferred = TransferOutcome(
+                status=TransferStatus.TRANSFERRED,
+                title=record.title,
+                source_url=record.source_url or None,
+                audio_path=audio_path,
+                transfer_path=completed_path,
+                message="Transferred",
+            )
+            if on_progress is not None:
+                on_progress(transferred)
+            return transferred
+        except Exception as exc:
+            self._remove_incomplete_transfer_artifacts(headphones_folder, record.filename)
+            return TransferOutcome(
+                status=TransferStatus.ERROR,
+                title=record.title,
+                source_url=record.source_url or None,
+                audio_path=audio_path,
+                transfer_path=transfer_path,
+                message=str(exc),
+            )
+
+    def _save_completed_record(self, record: TransferRecord, transfer_path: Path) -> None:
+        self.state_store.save(
+            TransferRecord(
+                source_id=record.source_id,
+                title=record.title,
+                filename=transfer_path.name,
+                byte_size=record.byte_size,
+                sha256=record.sha256,
+                source_url=record.source_url,
+                status=COMPLETED_TRANSFER,
+            )
+        )
+
+    def _recovery_audio_path(self, filename: str) -> Path:
+        return self.workspace / "recovery" / filename
+
+    def _matches_record(self, path: Path, record: TransferRecord) -> bool:
+        return path.exists() and path.stat().st_size == record.byte_size and self._sha256(path) == record.sha256
 
     def _transfer_filename(self, source_item: SourceItem, headphones_folder: Path) -> str:
         recorded = self.state_store.get(source_item.source_id)

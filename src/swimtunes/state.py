@@ -48,6 +48,8 @@ class JsonTransferStateStore:
                 filename=str(raw["filename"]),
                 byte_size=int(raw["byte_size"]),
                 sha256=str(raw["sha256"]),
+                source_url=str(raw.get("source_url", "")),
+                status=str(raw.get("status", "completed")),
             )
         except (KeyError, TypeError, ValueError):
             return None

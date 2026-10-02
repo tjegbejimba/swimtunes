@@ -1,7 +1,9 @@
+import errno
 from pathlib import Path
 
 from swimtunes.app import Workflow
-from swimtunes.models import MediaInfo, SourceItem, TransferStatus
+from swimtunes.adapters.settings import JsonSettingsStore
+from swimtunes.models import HeadphonesDeviceIdentity, MediaInfo, SourceItem, TransferStatus
 from swimtunes.state import JsonTransferStateStore
 
 
@@ -76,6 +78,47 @@ class FailingFilesystem:
         (headphones_folder / filename).write_bytes(b"partial")
         (headphones_folder / f"{filename}.incomplete").write_bytes(b"partial")
         raise IOError("Transfer verification failed before completion.")
+
+
+class SpaceExhaustedFilesystem(FailingFilesystem):
+    def transfer_verified(self, source: Path, headphones_folder: Path, filename: str) -> Path:
+        (headphones_folder / f"{filename}.incomplete").write_bytes(b"partial")
+        raise OSError(errno.ENOSPC, "No space left on Headphones Device")
+
+
+class UnpluggedMidCopyFilesystem(FailingFilesystem):
+    def transfer_verified(self, source: Path, headphones_folder: Path, filename: str) -> Path:
+        (headphones_folder / f"{filename}.incomplete").write_bytes(b"partial")
+        raise FileNotFoundError("Headphones Device disconnected during Transfer")
+
+
+class RecordingFilesystem:
+    def __init__(self) -> None:
+        self.transfers: list[tuple[Path, Path, str]] = []
+
+    def ensure_headphones_folder(self, folder: Path) -> None:
+        if not folder.exists():
+            raise ValueError("Choose an existing Headphones Folder before starting.")
+
+    def safe_audio_filename(self, title: str) -> str:
+        return "Lane Mix.mp3"
+
+    def transfer_verified(self, source: Path, headphones_folder: Path, filename: str) -> Path:
+        self.transfers.append((source, headphones_folder, filename))
+        destination = headphones_folder / filename
+        destination.write_bytes(source.read_bytes())
+        return destination
+
+
+class FakeDeviceIdentity:
+    def __init__(self, identity: HeadphonesDeviceIdentity | None) -> None:
+        self.identity = identity
+
+    def identity_for(self, folder: Path):
+        return self.identity
+
+    def find_folder(self, expected_identity, remembered_folder):
+        return remembered_folder if self.identity == expected_identity else None
 
 
 def test_single_source_item_transfer_reports_success_after_verified_copy(artifact_dir: Path) -> None:
@@ -247,7 +290,7 @@ def test_batch_progress_distinguishes_downloaded_audio_file_from_transfer(
         TransferStatus.TRANSFERRED,
     ]
     assert progress[0].message == "Downloaded Audio File"
-    assert progress[0].audio_path == artifact_dir / "workspace" / "audio" / "Lane Mix--a63668cb.mp3"
+    assert progress[0].audio_path == artifact_dir / "workspace" / "recovery" / "Lane Mix--a63668cb.mp3"
     assert progress[1].transfer_path == headphones_folder / "Lane Mix--a63668cb.mp3"
 
 
@@ -371,6 +414,177 @@ def test_corrupted_recorded_duplicate_reports_repair_needed_without_redownloadin
     result = restarted.transfer_one("https://www.youtube.com/watch?v=dQw4w9WgXcQ", headphones_folder)
 
     assert result.ok is False
-    assert result.outcomes[0].status is TransferStatus.ERROR
+    assert result.outcomes[0].status is TransferStatus.REPAIR_NEEDED
     assert "repair" in result.outcomes[0].message
     assert extractor.calls == []
+
+
+def test_failed_copy_keeps_pending_audio_file_for_restart_retry_without_redownloading(artifact_dir: Path) -> None:
+    source_media = artifact_dir / "source.webm"
+    source_media.write_bytes(b"source media")
+    headphones_folder = artifact_dir / "headphones"
+    headphones_folder.mkdir()
+    workspace = artifact_dir / "workspace"
+    state_path = workspace / "transfer-state.json"
+    extractor = RecordingExtractor(source_media)
+    first = Workflow(
+        extractor=extractor,
+        encoder=WritingEncoder(),
+        filesystem=FailingFilesystem(),
+        workspace=workspace,
+        state_store=JsonTransferStateStore(state_path),
+    )
+
+    failed = first.transfer_one("https://www.youtube.com/watch?v=dQw4w9WgXcQ", headphones_folder)
+
+    assert failed.ok is False
+    assert failed.outcomes[0].status is TransferStatus.ERROR
+    pending = first.pending_transfers()
+    assert len(pending) == 1
+    assert pending[0].status == "pending"
+    recovery_audio = workspace / "recovery" / pending[0].filename
+    assert recovery_audio.read_bytes() == b"verified mp3 payload"
+    assert not (headphones_folder / pending[0].filename).exists()
+    assert not (headphones_folder / f"{pending[0].filename}.incomplete").exists()
+
+    retry_filesystem = RecordingFilesystem()
+    retry_extractor = RecordingExtractor(source_media)
+    restarted = Workflow(
+        extractor=retry_extractor,
+        encoder=WritingEncoder(),
+        filesystem=retry_filesystem,
+        workspace=workspace,
+        state_store=JsonTransferStateStore(state_path),
+    )
+    retried = restarted.retry_pending("yt:test-video", headphones_folder)
+
+    assert retried.ok is True
+    assert retried.outcomes[0].status is TransferStatus.TRANSFERRED
+    assert retry_extractor.calls == []
+    assert retry_filesystem.transfers == [(recovery_audio, headphones_folder, pending[0].filename)]
+    assert restarted.pending_transfers() == []
+
+
+def test_space_exhausted_copy_keeps_pending_audio_and_reports_no_success(artifact_dir: Path) -> None:
+    source_media = artifact_dir / "source.webm"
+    source_media.write_bytes(b"source media")
+    headphones_folder = artifact_dir / "headphones"
+    headphones_folder.mkdir()
+    workspace = artifact_dir / "workspace"
+    workflow = Workflow(
+        extractor=RecordingExtractor(source_media),
+        encoder=WritingEncoder(),
+        filesystem=SpaceExhaustedFilesystem(),
+        workspace=workspace,
+    )
+
+    result = workflow.transfer_one("https://www.youtube.com/watch?v=dQw4w9WgXcQ", headphones_folder)
+
+    assert result.ok is False
+    assert result.outcomes[0].status is TransferStatus.ERROR
+    assert "space" in result.outcomes[0].message.lower() or "No space" in result.outcomes[0].message
+    assert len(workflow.pending_transfers()) == 1
+    pending = workflow.pending_transfers()[0]
+    assert (workspace / "recovery" / pending.filename).exists()
+    assert not (headphones_folder / pending.filename).exists()
+
+
+def test_unplug_mid_copy_preserves_recovery_audio_for_later_retry(artifact_dir: Path) -> None:
+    source_media = artifact_dir / "source.webm"
+    source_media.write_bytes(b"source media")
+    headphones_folder = artifact_dir / "headphones"
+    headphones_folder.mkdir()
+    workspace = artifact_dir / "workspace"
+    workflow = Workflow(
+        extractor=RecordingExtractor(source_media),
+        encoder=WritingEncoder(),
+        filesystem=UnpluggedMidCopyFilesystem(),
+        workspace=workspace,
+    )
+
+    result = workflow.transfer_one("https://www.youtube.com/watch?v=dQw4w9WgXcQ", headphones_folder)
+
+    assert result.ok is False
+    assert result.outcomes[0].status is TransferStatus.ERROR
+    assert "disconnected" in result.outcomes[0].message
+    pending = workflow.pending_transfers()[0]
+    assert (workspace / "recovery" / pending.filename).read_bytes() == b"verified mp3 payload"
+    assert list(headphones_folder.iterdir()) == []
+
+
+def test_retry_pending_requires_the_verified_remembered_headphones_device(artifact_dir: Path) -> None:
+    source_media = artifact_dir / "source.webm"
+    source_media.write_bytes(b"source media")
+    headphones_folder = artifact_dir / "headphones"
+    headphones_folder.mkdir()
+    workspace = artifact_dir / "workspace"
+    settings = JsonSettingsStore(artifact_dir / "settings.json")
+    correct_identity = HeadphonesDeviceIdentity(kind="test", stable_id="correct-device")
+    wrong_identity = HeadphonesDeviceIdentity(kind="test", stable_id="wrong-device")
+    first = Workflow(
+        extractor=RecordingExtractor(source_media),
+        encoder=WritingEncoder(),
+        filesystem=FailingFilesystem(),
+        settings=settings,
+        device_identity=FakeDeviceIdentity(correct_identity),
+        workspace=workspace,
+    )
+    assert first.choose_headphones_folder(headphones_folder).ok is True
+    first.transfer_one("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+    retry_filesystem = RecordingFilesystem()
+    restarted = Workflow(
+        extractor=RecordingExtractor(source_media),
+        encoder=WritingEncoder(),
+        filesystem=retry_filesystem,
+        settings=settings,
+        device_identity=FakeDeviceIdentity(wrong_identity),
+        workspace=workspace,
+    )
+
+    result = restarted.retry_pending("yt:test-video")
+
+    assert result.ok is False
+    assert result.outcomes[0].status is TransferStatus.ERROR
+    assert "identity could not be verified" in result.outcomes[0].message
+    assert retry_filesystem.transfers == []
+    assert len(restarted.pending_transfers()) == 1
+
+
+def test_retry_pending_damaged_destination_requires_confirmation_before_repair(
+    artifact_dir: Path,
+) -> None:
+    source_media = artifact_dir / "source.webm"
+    source_media.write_bytes(b"source media")
+    headphones_folder = artifact_dir / "headphones"
+    headphones_folder.mkdir()
+    workspace = artifact_dir / "workspace"
+    workflow = Workflow(
+        extractor=RecordingExtractor(source_media),
+        encoder=WritingEncoder(),
+        filesystem=FailingFilesystem(),
+        workspace=workspace,
+    )
+    workflow.transfer_one("https://www.youtube.com/watch?v=dQw4w9WgXcQ", headphones_folder)
+    pending = workflow.pending_transfers()[0]
+    damaged_destination = headphones_folder / pending.filename
+    damaged_destination.write_bytes(b"damaged app-owned copy")
+    retry_filesystem = RecordingFilesystem()
+    restarted = Workflow(
+        extractor=RecordingExtractor(source_media),
+        encoder=WritingEncoder(),
+        filesystem=retry_filesystem,
+        workspace=workspace,
+    )
+
+    blocked = restarted.retry_pending("yt:test-video", headphones_folder)
+
+    assert blocked.ok is False
+    assert blocked.outcomes[0].status is TransferStatus.REPAIR_NEEDED
+    assert "requires confirmation" in blocked.outcomes[0].message
+    assert damaged_destination.read_bytes() == b"damaged app-owned copy"
+    assert retry_filesystem.transfers == []
+
+    repaired = restarted.retry_pending("yt:test-video", headphones_folder, confirm_repair=True)
+
+    assert repaired.ok is True
+    assert damaged_destination.read_bytes() == b"verified mp3 payload"

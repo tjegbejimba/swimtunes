@@ -1,0 +1,5 @@
+# Pin extraction tools in CI-built portable Windows bundles
+
+Internal Windows portable builds bundle CI-downloaded, SHA256-verified copies of yt-dlp and FFmpeg instead of downloading tools on the swimmer's machine. The app resolves tools relative to the frozen PyInstaller bundle and falls back to PATH only in development. The bundle carries `TOOL_MANIFEST.json` and third-party notices so the exact versions, origins, hashes, and license obligations are visible before any release decision.
+
+For ticket #11, FFmpeg uses the Gyan.dev 9.0.2 essentials Windows x64 build because it has exact release URLs and published checksums suitable for reproducible CI validation. This is a clearly documented GPL distribution choice for internal artifacts, not yet a friend-facing release clearance. Before a signed public beta, the release process must recheck FFmpeg legal guidance, include matching build/source materials required by the chosen build, and may switch to an LGPL-oriented build if that better fits distribution obligations.

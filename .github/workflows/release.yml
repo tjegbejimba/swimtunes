@@ -1,0 +1,340 @@
+name: Signed beta release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Semantic version to release, for example 0.2.0-beta.1
+        required: true
+        type: string
+      signing_mode:
+        description: Authenticode signing provider
+        required: true
+        default: azure
+        type: choice
+        options:
+          - azure
+          - pfx
+      dry_run:
+        description: Build, sign, verify, and upload the payload artifact without publishing a release
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+env:
+  YTDLP_VERSION: '2026.08.19'
+  YTDLP_URL: 'https://github.com/yt-dlp/yt-dlp/releases/download/2026.08.19/yt-dlp.exe'
+  YTDLP_SHA256: '66674953fe251b89f4d08c5f0e35e0728679bd67ab3d7d05c0562af101dd3e7a'
+  FFMPEG_VERSION: '9.0.2'
+  FFMPEG_URL: 'https://github.com/GyanD/codexffmpeg/releases/download/9.0.2/ffmpeg-9.0.2-essentials_build.zip'
+  FFMPEG_SHA256: '60f467265b1e312373dbcd92200c2618a74850f98d3d078e94296bb3fa2047ba'
+  RELEASE_REPOSITORY: tjegbejimba/swimtunes-releases
+
+jobs:
+  preflight:
+    name: Check release inputs and secrets
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail if release secrets or variables are missing
+        env:
+          SIGNING_MODE: ${{ inputs.signing_mode }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          SWIMTUNES_UPDATE_PUBLIC_KEY: ${{ vars.SWIMTUNES_UPDATE_PUBLIC_KEY }}
+          SWIMTUNES_UPDATE_PUBLISHER: ${{ vars.SWIMTUNES_UPDATE_PUBLISHER }}
+          SWIMTUNES_UPDATE_PRIVATE_KEY: ${{ secrets.SWIMTUNES_UPDATE_PRIVATE_KEY }}
+          SWIMTUNES_RELEASES_PUBLISH_TOKEN: ${{ secrets.SWIMTUNES_RELEASES_PUBLISH_TOKEN }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          AZURE_ARTIFACT_SIGNING_ENDPOINT: ${{ vars.AZURE_ARTIFACT_SIGNING_ENDPOINT }}
+          AZURE_SIGNING_ACCOUNT_NAME: ${{ vars.AZURE_SIGNING_ACCOUNT_NAME }}
+          AZURE_CERTIFICATE_PROFILE_NAME: ${{ vars.AZURE_CERTIFICATE_PROFILE_NAME }}
+          WINDOWS_SIGNING_PFX_BASE64: ${{ secrets.WINDOWS_SIGNING_PFX_BASE64 }}
+          WINDOWS_SIGNING_PFX_PASSWORD: ${{ secrets.WINDOWS_SIGNING_PFX_PASSWORD }}
+        run: |
+          python - <<'PY'
+          import os
+          base = [
+              "SWIMTUNES_UPDATE_PUBLIC_KEY",
+              "SWIMTUNES_UPDATE_PUBLISHER",
+              "SWIMTUNES_UPDATE_PRIVATE_KEY",
+          ]
+          if os.environ["DRY_RUN"].lower() != "true":
+              base.append("SWIMTUNES_RELEASES_PUBLISH_TOKEN")
+          mode = os.environ["SIGNING_MODE"]
+          if mode == "azure":
+              base += [
+                  "AZURE_TENANT_ID",
+                  "AZURE_CLIENT_ID",
+                  "AZURE_CLIENT_SECRET",
+                  "AZURE_ARTIFACT_SIGNING_ENDPOINT",
+                  "AZURE_SIGNING_ACCOUNT_NAME",
+                  "AZURE_CERTIFICATE_PROFILE_NAME",
+              ]
+          elif mode == "pfx":
+              base += ["WINDOWS_SIGNING_PFX_BASE64", "WINDOWS_SIGNING_PFX_PASSWORD"]
+          else:
+              raise SystemExit(f"unsupported signing mode: {mode}")
+          missing = [name for name in base if not os.environ.get(name)]
+          if missing:
+              raise SystemExit("Missing required release secret/variable(s): " + ", ".join(missing))
+          PY
+
+  build-sign-package:
+    name: Build, sign, verify, and package
+    runs-on: windows-latest
+    needs: preflight
+    outputs:
+      artifact_name: ${{ steps.names.outputs.artifact_name }}
+      tag_name: ${{ steps.names.outputs.tag_name }}
+    env:
+      RELEASE_VERSION: ${{ inputs.version }}
+      SIGNING_MODE: ${{ inputs.signing_mode }}
+      SWIMTUNES_UPDATE_PUBLIC_KEY: ${{ vars.SWIMTUNES_UPDATE_PUBLIC_KEY }}
+      SWIMTUNES_UPDATE_PUBLISHER: ${{ vars.SWIMTUNES_UPDATE_PUBLISHER }}
+      SWIMTUNES_UPDATE_PRIVATE_KEY: ${{ secrets.SWIMTUNES_UPDATE_PRIVATE_KEY }}
+      SWIMTUNES_UPDATE_REPOSITORY: tjegbejimba/swimtunes-releases
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Validate requested version
+        id: names
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:RELEASE_VERSION -notmatch '^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$') {
+            throw "Version must be semantic, e.g. 0.2.0-beta.1"
+          }
+          "artifact_name=SwimTunes-$env:RELEASE_VERSION-windows-x64.zip" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "tag_name=v$env:RELEASE_VERSION" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Embed update trust anchors
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          uv run python -c "from pathlib import Path; import os; Path('src/swimtunes/_release_config.py').write_text('UPDATE_PUBLIC_KEY = '+repr(os.environ['SWIMTUNES_UPDATE_PUBLIC_KEY'])+'\nUPDATE_PUBLISHER = '+repr(os.environ['SWIMTUNES_UPDATE_PUBLISHER'])+'\nUPDATE_REPOSITORY = '+repr(os.environ['SWIMTUNES_UPDATE_REPOSITORY'])+'\n', encoding='utf-8')"
+
+      - name: Download pinned tools
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force build/windows/downloads, build/windows/tools | Out-Null
+
+          $ytDlpDownload = 'build/windows/downloads/yt-dlp.exe'
+          Invoke-WebRequest -Uri $env:YTDLP_URL -OutFile $ytDlpDownload
+          $ytDlpHash = (Get-FileHash $ytDlpDownload -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($ytDlpHash -ne $env:YTDLP_SHA256) { throw "yt-dlp SHA256 mismatch: $ytDlpHash" }
+          Copy-Item $ytDlpDownload build/windows/tools/yt-dlp.exe
+
+          $ffmpegDownload = 'build/windows/downloads/ffmpeg.zip'
+          Invoke-WebRequest -Uri $env:FFMPEG_URL -OutFile $ffmpegDownload
+          $ffmpegHash = (Get-FileHash $ffmpegDownload -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($ffmpegHash -ne $env:FFMPEG_SHA256) { throw "FFmpeg SHA256 mismatch: $ffmpegHash" }
+          Expand-Archive -Path $ffmpegDownload -DestinationPath build/windows/ffmpeg-unpack -Force
+          $ffmpegRoot = Get-ChildItem build/windows/ffmpeg-unpack -Directory | Select-Object -First 1
+          Copy-Item "$($ffmpegRoot.FullName)/bin/ffmpeg.exe" build/windows/tools/ffmpeg.exe
+          Copy-Item "$($ffmpegRoot.FullName)/bin/ffprobe.exe" build/windows/tools/ffprobe.exe
+          Copy-Item docs/third-party.md build/windows/tools/THIRD_PARTY_NOTICES.md
+
+          $manifest = [ordered]@{
+            generated_by = 'github-actions/signed-release'
+            tools = [ordered]@{
+              'yt-dlp' = [ordered]@{
+                version = $env:YTDLP_VERSION
+                origin = $env:YTDLP_URL
+                sha256 = $env:YTDLP_SHA256
+                license = 'Unlicense'
+              }
+              ffmpeg = [ordered]@{
+                version = $env:FFMPEG_VERSION
+                origin = $env:FFMPEG_URL
+                sha256 = $env:FFMPEG_SHA256
+                build = 'Gyan.dev essentials build for Windows x64'
+                license = 'GPLv3-or-later aggregate build; see THIRD_PARTY_NOTICES.md and FFMPEG_SOURCE_DETAILS.md'
+              }
+            }
+          }
+          $manifest | ConvertTo-Json -Depth 8 | Set-Content -Encoding UTF8 build/windows/tools/TOOL_MANIFEST.json
+
+      - name: Run tests
+        run: uv run pytest -q
+
+      - name: Build versioned portable bundle
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          uv run pyinstaller --noconfirm --clean --name SwimTunes --onedir --windowed --hidden-import PySide6.QtWidgets --add-data 'build/windows/tools;tools' --distpath build/windows/app-dist src/swimtunes/gui.py
+          uv run pyinstaller --noconfirm --clean --name SwimTunes --onefile --windowed --distpath build/windows/launcher-dist src/swimtunes/launcher.py
+
+          $portable = 'dist/SwimTunesPortable'
+          $versionRoot = Join-Path $portable "versions/$env:RELEASE_VERSION"
+          New-Item -ItemType Directory -Force $versionRoot | Out-Null
+          Copy-Item build/windows/app-dist/SwimTunes (Join-Path $versionRoot 'SwimTunes') -Recurse
+          Copy-Item build/windows/launcher-dist/SwimTunes.exe (Join-Path $portable 'SwimTunes.exe')
+          Copy-Item docs/third-party.md (Join-Path $portable 'THIRD_PARTY_NOTICES.md')
+          Copy-Item docs/third-party.md (Join-Path $versionRoot 'SwimTunes/THIRD_PARTY_NOTICES.md')
+          Copy-Item build/windows/tools/TOOL_MANIFEST.json (Join-Path $versionRoot 'SwimTunes/TOOL_MANIFEST.json')
+
+          @{ version = $env:RELEASE_VERSION } | ConvertTo-Json -Compress | Set-Content -Encoding UTF8 (Join-Path $portable 'current.json')
+          [ordered]@{
+            version = $env:RELEASE_VERSION
+            artifact = "SwimTunes-$env:RELEASE_VERSION-windows-x64.zip"
+            sha256 = 'filled-after-archive'
+            publisher = $env:SWIMTUNES_UPDATE_PUBLISHER
+            executable = 'SwimTunes/SwimTunes.exe'
+          } | ConvertTo-Json -Depth 4 | Set-Content -Encoding UTF8 (Join-Path $versionRoot 'UPDATE_VERIFIED.json')
+          Set-Content -Encoding UTF8 (Join-Path $versionRoot 'INSTALL_COMPLETE') 'ok'
+
+      - name: Sign exe and dll files with Azure Artifact Signing
+        if: inputs.signing_mode == 'azure'
+        uses: azure/artifact-signing-action@v2
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: ${{ vars.AZURE_ARTIFACT_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ vars.AZURE_SIGNING_ACCOUNT_NAME }}
+          certificate-profile-name: ${{ vars.AZURE_CERTIFICATE_PROFILE_NAME }}
+          files-folder: ${{ github.workspace }}\dist\SwimTunesPortable
+          files-folder-filter: exe,dll
+          files-folder-recurse: true
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - name: Sign exe and dll files with PFX certificate
+        if: inputs.signing_mode == 'pfx'
+        shell: pwsh
+        env:
+          WINDOWS_SIGNING_PFX_BASE64: ${{ secrets.WINDOWS_SIGNING_PFX_BASE64 }}
+          WINDOWS_SIGNING_PFX_PASSWORD: ${{ secrets.WINDOWS_SIGNING_PFX_PASSWORD }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $pfxPath = Join-Path $PWD 'build/windows/signing-certificate.pfx'
+          [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:WINDOWS_SIGNING_PFX_BASE64))
+          $password = ConvertTo-SecureString $env:WINDOWS_SIGNING_PFX_PASSWORD -AsPlainText -Force
+          $cert = Import-PfxCertificate -FilePath $pfxPath -CertStoreLocation Cert:\CurrentUser\My -Password $password
+          try {
+            $files = Get-ChildItem dist/SwimTunesPortable -Recurse -File -Include *.exe,*.dll
+            foreach ($file in $files) {
+              $signature = Set-AuthenticodeSignature -FilePath $file.FullName -Certificate $cert -HashAlgorithm SHA256 -TimestampServer 'http://timestamp.digicert.com'
+              if ($signature.Status -ne 'Valid') { throw "Signing failed for $($file.FullName): $($signature.Status)" }
+            }
+          } finally {
+            Remove-Item "Cert:\CurrentUser\My\$($cert.Thumbprint)" -ErrorAction SilentlyContinue
+            Remove-Item $pfxPath -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Verify Authenticode signatures and publisher
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $files = Get-ChildItem dist/SwimTunesPortable -Recurse -File -Include *.exe,*.dll
+          if ($files.Count -eq 0) { throw 'No exe/dll files found to verify.' }
+          foreach ($file in $files) {
+            $sig = Get-AuthenticodeSignature -LiteralPath $file.FullName
+            if ($sig.Status -ne 'Valid') { throw "Invalid Authenticode signature on $($file.FullName): $($sig.Status)" }
+            $subject = [string]$sig.SignerCertificate.Subject
+            if (-not $subject.Contains($env:SWIMTUNES_UPDATE_PUBLISHER)) {
+              throw "Unexpected publisher on $($file.FullName): $subject"
+            }
+          }
+
+      - name: Smoke launch signed bundle self-check
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:PATH = ''
+          $process = Start-Process -FilePath dist/SwimTunesPortable/SwimTunes.exe -ArgumentList '--self-check' -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "SwimTunes self-check failed with $($process.ExitCode)" }
+
+      - name: Assemble public release payload
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $artifactName = 'SwimTunes-' + $env:RELEASE_VERSION + '-windows-x64.zip'
+          New-Item -ItemType Directory -Force dist/public-release | Out-Null
+          New-Item -ItemType Directory -Force build/release-root | Out-Null
+          if (Test-Path build/release-root/SwimTunes) { Remove-Item build/release-root/SwimTunes -Recurse -Force }
+          Copy-Item dist/SwimTunesPortable build/release-root/SwimTunes -Recurse
+          Compress-Archive -Path build/release-root/SwimTunes -DestinationPath "dist/public-release/$artifactName" -Force
+          Copy-Item docs/third-party.md dist/public-release/THIRD_PARTY_NOTICES.md
+          Copy-Item build/windows/tools/TOOL_MANIFEST.json dist/public-release/TOOL_MANIFEST.json
+          @"
+          # FFmpeg source and build details
+
+          SwimTunes $env:RELEASE_VERSION bundles FFmpeg $env:FFMPEG_VERSION from the Gyan.dev Windows x64 essentials build.
+
+          - Binary archive: $env:FFMPEG_URL
+          - Binary SHA256: $env:FFMPEG_SHA256
+          - Upstream release/source information: https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-$env:FFMPEG_VERSION-full_build-shared.7z and https://github.com/FFmpeg/FFmpeg/releases/tag/n$env:FFMPEG_VERSION
+          - License/materials: see THIRD_PARTY_NOTICES.md and TOOL_MANIFEST.json.
+
+          Recheck these details against the exact public release before approval.
+          "@ | Set-Content -Encoding UTF8 dist/public-release/FFMPEG_SOURCE_DETAILS.md
+          @"
+          # SwimTunes $env:RELEASE_VERSION beta
+
+          This is a beta portable Windows build. Playback on the actual swim headphones is unverified, so this release does not claim physical-headphones compatibility.
+
+          The package contains signed versioned binaries, signed update metadata, third-party notices, tool inventory, and FFmpeg source/build details only.
+          "@ | Set-Content -Encoding UTF8 dist/public-release/RELEASE_NOTES.md
+
+      - name: Generate and verify signed update manifest
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $artifact = "dist/public-release/SwimTunes-$env:RELEASE_VERSION-windows-x64.zip"
+          uv run python scripts/release_manifest.py generate --artifact $artifact --version $env:RELEASE_VERSION --publisher $env:SWIMTUNES_UPDATE_PUBLISHER --output dist/public-release/update-manifest.json --signature-output dist/public-release/update-manifest.json.sig
+          $embeddedPublicKey = (uv run python -c "from swimtunes import _release_config; print(_release_config.UPDATE_PUBLIC_KEY)").Trim()
+          uv run python scripts/release_manifest.py verify --manifest dist/public-release/update-manifest.json --signature dist/public-release/update-manifest.json.sig --public-key-base64 $embeddedPublicKey
+
+      - name: Audit public release payload
+        shell: pwsh
+        run: uv run python scripts/audit_release_payload.py dist/public-release
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: signed-public-release-payload
+          path: dist/public-release
+          if-no-files-found: error
+
+  publish:
+    name: Publish public beta release
+    runs-on: ubuntu-latest
+    needs: build-sign-package
+    if: inputs.dry_run == false
+    environment: release
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: signed-public-release-payload
+          path: public-release
+      - name: Publish pre-release to public binary repository
+        env:
+          GH_TOKEN: ${{ secrets.SWIMTUNES_RELEASES_PUBLISH_TOKEN }}
+          TAG_NAME: ${{ needs.build-sign-package.outputs.tag_name }}
+          ARTIFACT_NAME: ${{ needs.build-sign-package.outputs.artifact_name }}
+        run: |
+          gh release create "$TAG_NAME" \
+            --repo "$RELEASE_REPOSITORY" \
+            --title "SwimTunes ${TAG_NAME#v} beta" \
+            --notes-file public-release/RELEASE_NOTES.md \
+            --prerelease \
+            "public-release/$ARTIFACT_NAME" \
+            public-release/update-manifest.json \
+            public-release/update-manifest.json.sig \
+            public-release/THIRD_PARTY_NOTICES.md \
+            public-release/TOOL_MANIFEST.json \
+            public-release/FFMPEG_SOURCE_DETAILS.md

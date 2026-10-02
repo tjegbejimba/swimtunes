@@ -1,6 +1,6 @@
 # SwimTunes
 
-SwimTunes is a planned desktop app for putting audio from public YouTube and SoundCloud links onto filesystem-mounted swim headphones. This private repository currently holds the [domain glossary](GLOSSARY.md) and [architecture decisions](docs/adr/); the app has not been implemented. The old `~/SwimTunes` PowerShell files are reference material, not the app.
+SwimTunes is a desktop app for putting audio from public YouTube and SoundCloud links onto filesystem-mounted swim headphones. The current foundation is a shared Python package with an app-level workflow seam, replaceable external adapters, and a thin PySide6 GUI. The old `~/SwimTunes` PowerShell files are reference material, not the app.
 
 ## Locked v1 scope
 
@@ -19,3 +19,20 @@ SwimTunes source stays in this **private** repository. Publish signed portable W
 Before any friend-facing release, choose an FFmpeg build with suitable license terms and prepare the matching license notices, build details, and corresponding FFmpeg source as required by that build and its dependencies. Check the [FFmpeg distribution guidance](https://www.ffmpeg.org/legal.html). Build the Windows target, pin and bundle extraction tools, sign the release with the designated publisher, and have the startup updater verify the trusted signature and publisher of both the update information and the new build before accepting it. If fetching or verification fails, warn and keep running the current signed version; do not treat a failed update as success.
 
 macOS tests do not establish Windows playback or headphones compatibility. No actual Windows/headphones test is available yet, so the first release must say **beta** and must not claim verified playback. YouTube extraction is unofficial and YouTube's terms restrict third-party downloading; a public URL is not permission to bypass those terms. See [ADR 0003](docs/adr/0003-unofficial-extraction-boundary.md).
+
+The human release checklist lives in [docs/release.md](docs/release.md). It covers signing identity setup, Ed25519 update keys, the protected `release` environment, scoped public-repository token, dry-run review, live feed verification, and the beta/no-playback-claim requirement.
+
+## Development
+
+Use `uv` from the repository root:
+
+```bash
+uv run pytest
+uv run swimtunes
+```
+
+## Portable Windows development artifact
+
+GitHub Actions runs `uv run pytest -q` on macOS and Windows. Pushes also build an internal Windows x64 portable layout with a stable root launcher (`SwimTunes.exe`) and the current PyInstaller onedir app under `versions/<version>/SwimTunes`. Pinned yt-dlp and FFmpeg binaries are downloaded in CI from exact URLs and verified by SHA256. The bundle includes `tools/TOOL_MANIFEST.json` and `THIRD_PARTY_NOTICES.md`, and CI smoke-runs the root launcher with `--self-check` to verify the frozen app can resolve its bundled tools without a system Python install. This artifact is internal only and is not uploaded to any public release repository.
+
+Tests must not hit live YouTube or SoundCloud. Workflow tests inject deterministic adapters at `swimtunes.app.Workflow`; real media-shape coverage uses locally generated `ffmpeg` fixtures and `ffprobe`.

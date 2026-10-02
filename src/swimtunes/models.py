@@ -13,6 +13,27 @@ class SourceItem:
 
 
 @dataclass(frozen=True)
+class SourcePlaylistEntry:
+    source_id: str
+    url: str
+    title: str
+    available: bool = True
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class SourcePlaylist:
+    url: str
+    title: str | None = None
+    entries: list[SourcePlaylistEntry] | None = None
+    error: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.entries is None:
+            object.__setattr__(self, "entries", [])
+
+
+@dataclass(frozen=True)
 class MediaInfo:
     codec: str
     channels: int

@@ -3,10 +3,13 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Protocol
 
-from swimtunes.models import MediaInfo, SourceItem
+from swimtunes.models import MediaInfo, SourceItem, SourcePlaylist
 
 
 class Extractor(Protocol):
+    def preview(self, url: str) -> SourcePlaylist:
+        """Resolve Source Playlist metadata without downloading Source Items."""
+
     def extract(self, url: str, work_dir: Path) -> tuple[SourceItem, Path]:
         """Extract a public Source Item and return metadata plus the local media path."""
 

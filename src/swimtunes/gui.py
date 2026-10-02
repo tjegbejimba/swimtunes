@@ -15,6 +15,7 @@ def _build_main_window():
     from PySide6.QtWidgets import (
         QFileDialog,
         QHBoxLayout,
+        QCheckBox,
         QLabel,
         QLineEdit,
         QMainWindow,
@@ -29,6 +30,8 @@ def _build_main_window():
             super().__init__()
             self.workflow = workflow or Workflow()
             self.headphones_folder: Path | None = None
+            self.playlist_entries = []
+            self.playlist_checkboxes = []
             self.setWindowTitle("SwimTunes")
 
             self.url_input = QLineEdit()
@@ -36,8 +39,13 @@ def _build_main_window():
             self.folder_label = QLabel("No Headphones Folder selected")
             choose_button = QPushButton("Choose Headphones Folder")
             choose_button.clicked.connect(self.choose_headphones_folder)
-            transfer_button = QPushButton("Transfer")
-            transfer_button.clicked.connect(self.transfer)
+            preview_button = QPushButton("Preview Playlist")
+            preview_button.clicked.connect(self.preview)
+            self.transfer_button = QPushButton("Transfer")
+            self.transfer_button.clicked.connect(self.transfer)
+            self.preview_container = QWidget()
+            self.preview_layout = QVBoxLayout()
+            self.preview_container.setLayout(self.preview_layout)
             self.output = QTextEdit()
             self.output.setReadOnly(True)
 
@@ -48,8 +56,10 @@ def _build_main_window():
             layout = QVBoxLayout()
             layout.addWidget(QLabel("Source Item URL"))
             layout.addWidget(self.url_input)
+            layout.addWidget(preview_button)
+            layout.addWidget(self.preview_container)
             layout.addLayout(folder_row)
-            layout.addWidget(transfer_button)
+            layout.addWidget(self.transfer_button)
             layout.addWidget(self.output)
             container = QWidget()
             container.setLayout(layout)
@@ -61,11 +71,37 @@ def _build_main_window():
                 self.headphones_folder = Path(selected)
                 self.folder_label.setText(selected)
 
+        def preview(self) -> None:
+            playlist = self.workflow.preview(self.url_input.text())
+            self._clear_playlist_preview()
+            if playlist.error:
+                self.output.setPlainText(f"Error: {playlist.error}")
+                self.transfer_button.setEnabled(True)
+                return
+            self.playlist_entries = list(playlist.entries)
+            for entry in self.playlist_entries:
+                label = entry.title if entry.available else f"{entry.title} — {entry.error or 'unavailable'}"
+                checkbox = QCheckBox(label)
+                checkbox.setChecked(False)
+                checkbox.setEnabled(entry.available)
+                checkbox.toggled.connect(self._update_transfer_enabled)
+                self.playlist_checkboxes.append(checkbox)
+                self.preview_layout.addWidget(checkbox)
+            self.output.setPlainText(f"Preview: {playlist.title or 'Source Playlist'}")
+            self._update_transfer_enabled()
+
         def transfer(self) -> None:
             if self.headphones_folder is None:
                 self.output.setPlainText("Choose a Headphones Folder before starting.")
                 return
-            result = self.workflow.transfer_one(self.url_input.text(), self.headphones_folder)
+            selected_entries = self._selected_playlist_entries()
+            if self.playlist_entries:
+                if not selected_entries:
+                    self.output.setPlainText("Select at least one Source Item before starting.")
+                    return
+                result = self.workflow.transfer_selected(selected_entries, self.headphones_folder)
+            else:
+                result = self.workflow.transfer_one(self.url_input.text(), self.headphones_folder)
             lines = []
             for outcome in result.outcomes:
                 if outcome.status is TransferStatus.TRANSFERRED:
@@ -74,6 +110,28 @@ def _build_main_window():
                     label = outcome.title or outcome.source_url or "Source Item"
                     lines.append(f"Error: {label}: {outcome.message}")
             self.output.setPlainText("\n".join(lines))
+
+        def _clear_playlist_preview(self) -> None:
+            while self.preview_layout.count():
+                item = self.preview_layout.takeAt(0)
+                widget = item.widget()
+                if widget is not None:
+                    widget.deleteLater()
+            self.playlist_entries = []
+            self.playlist_checkboxes = []
+
+        def _selected_playlist_entries(self):
+            return [
+                entry
+                for entry, checkbox in zip(self.playlist_entries, self.playlist_checkboxes, strict=False)
+                if checkbox.isChecked()
+            ]
+
+        def _update_transfer_enabled(self) -> None:
+            if self.playlist_entries:
+                self.transfer_button.setEnabled(bool(self._selected_playlist_entries()))
+            else:
+                self.transfer_button.setEnabled(True)
 
     return SwimTunesWindow
 

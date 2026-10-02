@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable
+import hashlib
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
@@ -13,10 +14,12 @@ from swimtunes.models import (
     SourcePlaylist,
     SourcePlaylistEntry,
     TransferOutcome,
+    TransferRecord,
     TransferStatus,
 )
 from swimtunes.paths import default_workspace
-from swimtunes.ports import Encoder, Extractor, FileSystem
+from swimtunes.ports import Encoder, Extractor, FileSystem, TransferStateStore
+from swimtunes.state import JsonTransferStateStore
 
 ProgressCallback = Callable[[TransferOutcome], None]
 SourceInput = str | SourceItem | SourcePlaylistEntry
@@ -29,11 +32,13 @@ class Workflow:
         encoder: Encoder | None = None,
         filesystem: FileSystem | None = None,
         workspace: Path | None = None,
+        state_store: TransferStateStore | None = None,
     ) -> None:
         self.extractor = extractor or YtDlpExtractor()
         self.encoder = encoder or FfmpegMediaAdapter()
         self.filesystem = filesystem or LocalFilesystemAdapter()
         self.workspace = workspace or default_workspace()
+        self.state_store = state_store or JsonTransferStateStore(self.workspace / "transfer-state.json")
 
     def transfer_one(self, url: str, headphones_folder: Path) -> OperationResult:
         return self.run([url], headphones_folder)
@@ -123,8 +128,18 @@ class Workflow:
 
         try:
             self.workspace.mkdir(parents=True, exist_ok=True)
-            source_item, extracted_path = self.extractor.extract(url, self.workspace / "extracted")
-            filename = self.filesystem.safe_audio_filename(source_item.title)
+            source_item = self._resolve_source_item(item, url)
+            existing = self._existing_record_outcome(source_item, headphones_folder)
+            if existing is not None:
+                return existing
+
+            extracted_item, extracted_path = self.extractor.extract(url, self.workspace / "extracted")
+            source_item = SourceItem(
+                source_id=source_item.source_id,
+                url=url,
+                title=extracted_item.title or source_item.title,
+            )
+            filename = self._transfer_filename(source_item, headphones_folder)
             audio_path = self.workspace / "audio" / filename
             audio_path.parent.mkdir(parents=True, exist_ok=True)
             media_info = self.encoder.encode_mp3(extracted_path, audio_path)
@@ -154,6 +169,15 @@ class Workflow:
             if on_progress is not None:
                 on_progress(downloaded)
             transfer_path = self.filesystem.transfer_verified(audio_path, headphones_folder, filename)
+            self.state_store.save(
+                TransferRecord(
+                    source_id=source_item.source_id,
+                    title=source_item.title,
+                    filename=transfer_path.name,
+                    byte_size=audio_path.stat().st_size,
+                    sha256=self._sha256(audio_path),
+                )
+            )
             transferred = TransferOutcome(
                 status=TransferStatus.TRANSFERRED,
                 title=source_item.title,
@@ -187,6 +211,13 @@ class Workflow:
             return item.title
         return None
 
+    def _resolve_source_item(self, item: SourceInput, url: str) -> SourceItem:
+        if isinstance(item, SourceItem):
+            return item
+        if isinstance(item, SourcePlaylistEntry):
+            return SourceItem(source_id=item.source_id, url=item.url, title=item.title)
+        return self.extractor.resolve(url)
+
     def _is_supported_public_url(self, url: str) -> bool:
         parsed = urlparse(url)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
@@ -219,3 +250,65 @@ class Workflow:
                 path.unlink(missing_ok=True)
             except OSError:
                 pass
+
+    def _existing_record_outcome(
+        self,
+        source_item: SourceItem,
+        headphones_folder: Path,
+    ) -> TransferOutcome | None:
+        record = self.state_store.get(source_item.source_id)
+        if record is None:
+            return None
+        transfer_path = headphones_folder / record.filename
+        if (
+            transfer_path.exists()
+            and transfer_path.stat().st_size == record.byte_size
+            and self._sha256(transfer_path) == record.sha256
+        ):
+            return TransferOutcome(
+                status=TransferStatus.ALREADY_PRESENT,
+                title=source_item.title,
+                source_url=source_item.url,
+                transfer_path=transfer_path,
+                message="Already present",
+            )
+        if transfer_path.exists():
+            return TransferOutcome(
+                status=TransferStatus.ERROR,
+                title=source_item.title,
+                source_url=source_item.url,
+                transfer_path=transfer_path,
+                message="Existing Transfer appears damaged; repair is required before retry.",
+            )
+        return None
+
+    def _transfer_filename(self, source_item: SourceItem, headphones_folder: Path) -> str:
+        recorded = self.state_store.get(source_item.source_id)
+        if recorded is not None:
+            return recorded.filename
+
+        safe = self.filesystem.safe_audio_filename(source_item.title)
+        suffix = hashlib.sha256(source_item.source_id.encode("utf-8")).hexdigest()[:8]
+        if safe.lower().endswith(".mp3"):
+            stem = safe[:-4]
+            extension = ".mp3"
+        else:
+            stem = safe
+            extension = ".mp3"
+        candidate = f"{stem}--{suffix}{extension}"
+        known_owned = {record.filename for record in self.state_store.all()}
+        if candidate not in known_owned and not (headphones_folder / candidate).exists():
+            return candidate
+        counter = 2
+        while True:
+            next_candidate = f"{stem}--{suffix}-{counter}{extension}"
+            if next_candidate not in known_owned and not (headphones_folder / next_candidate).exists():
+                return next_candidate
+            counter += 1
+
+    def _sha256(self, path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()

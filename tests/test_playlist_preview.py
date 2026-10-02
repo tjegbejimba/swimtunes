@@ -86,10 +86,10 @@ def test_selected_playlist_entries_alone_are_transferred_with_per_item_outcomes(
     assert result.ok is False
     assert [outcome.status for outcome in result.outcomes] == [TransferStatus.TRANSFERRED, TransferStatus.ERROR]
     assert result.outcomes[0].title == "Lane Two"
-    assert result.outcomes[0].transfer_path == headphones_folder / "Lane Two.mp3"
+    assert result.outcomes[0].transfer_path == headphones_folder / "Lane Two--5eb3c78c.mp3"
     assert "unavailable" in result.outcomes[1].message
     assert extractor.extract_calls == ["https://www.youtube.com/watch?v=lane2"]
-    assert sorted(path.name for path in headphones_folder.iterdir()) == ["Lane Two.mp3"]
+    assert sorted(path.name for path in headphones_folder.iterdir()) == ["Lane Two--5eb3c78c.mp3"]
 
 
 def test_video_url_with_incidental_list_is_not_a_playlist_preview(artifact_dir: Path) -> None:

@@ -131,6 +131,8 @@ def _build_main_window():
                 if outcome.status is TransferStatus.TRANSFERRED:
                     if label not in transferred_labels:
                         lines.append(f"Transferred: {label} -> {outcome.transfer_path}")
+                elif outcome.status is TransferStatus.ALREADY_PRESENT:
+                    lines.append(f"Already present: {label} -> {outcome.transfer_path}")
                 else:
                     lines.append(f"Error: {label}: {outcome.message}")
             self.output.setPlainText("\n".join(lines))

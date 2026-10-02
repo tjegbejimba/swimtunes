@@ -14,6 +14,8 @@ from swimtunes.adapters.settings import JsonSettingsStore
 from swimtunes.adapters.ytdlp import YtDlpExtractor
 from swimtunes.models import (
     HeadphonesFolderSelection,
+    LocalAudioFile,
+    LocalLibrarySettings,
     OperationResult,
     SelectionSpaceSummary,
     SourceItem,
@@ -40,6 +42,7 @@ ProgressCallback = Callable[[TransferOutcome], None]
 SourceInput = str | SourceItem | SourcePlaylistEntry
 PENDING_TRANSFER = "pending"
 COMPLETED_TRANSFER = "completed"
+LOCAL_TRANSFER = "local"
 ESTIMATED_AUDIO_BYTES_PER_SECOND = 24_000
 ESTIMATE_MARGIN_RATIO = 0.05
 
@@ -97,6 +100,96 @@ class Workflow:
             ])
         except Exception as exc:
             return OperationResult([TransferOutcome(status=TransferStatus.ERROR, message=str(exc))])
+
+    def local_library_settings(self) -> LocalLibrarySettings:
+        return self.settings.load_local_library()
+
+    def configure_local_library(
+        self,
+        enabled: bool,
+        local_library: Path | None,
+        headphones_folder: Path | None = None,
+    ) -> OperationResult:
+        try:
+            if not enabled:
+                self.settings.save_local_library(LocalLibrarySettings(enabled=False, path=None))
+                return OperationResult(
+                    [TransferOutcome(status=TransferStatus.TRANSFERRED, message="Local Library disabled.")]
+                )
+            if local_library is None:
+                raise ValueError("Choose a Local Library before enabling keep local MP3s.")
+            self._ensure_local_library(local_library)
+            selected_headphones = headphones_folder
+            if selected_headphones is None and (selection := self.settings.load_headphones_folder()) is not None:
+                selected_headphones = selection.path
+            if selected_headphones is not None and local_library.resolve() == selected_headphones.resolve():
+                raise ValueError("Choose a Local Library separate from the Headphones Folder.")
+            self.settings.save_local_library(LocalLibrarySettings(enabled=True, path=local_library))
+            return OperationResult(
+                [TransferOutcome(status=TransferStatus.TRANSFERRED, message="Local Library settings saved.")]
+            )
+        except Exception as exc:
+            return OperationResult([TransferOutcome(status=TransferStatus.ERROR, message=str(exc))])
+
+    def local_audio_files(self) -> list[LocalAudioFile]:
+        settings = self.settings.load_local_library()
+        if not settings.enabled or settings.path is None or not settings.path.exists():
+            return []
+        files: list[LocalAudioFile] = []
+        for record in self.state_store.all():
+            audio_path = settings.path / record.filename
+            if record.status in {LOCAL_TRANSFER, COMPLETED_TRANSFER} and self._matches_record(audio_path, record):
+                files.append(
+                    LocalAudioFile(
+                        source_id=record.source_id,
+                        title=record.title,
+                        source_url=record.source_url or None,
+                        path=audio_path,
+                        byte_size=record.byte_size,
+                        sha256=record.sha256,
+                    )
+                )
+        return files
+
+    def transfer_local_audio(
+        self,
+        source_id: str,
+        headphones_folder: Path | None = None,
+        on_progress: ProgressCallback | None = None,
+    ) -> OperationResult:
+        record = self.state_store.get(source_id)
+        if record is None:
+            return OperationResult(
+                [TransferOutcome(status=TransferStatus.ERROR, message="No Local Library Audio File is available.")]
+            )
+        try:
+            local_library = self._require_local_library()
+            audio_path = local_library / record.filename
+            if not self._matches_record(audio_path, record):
+                raise ValueError("Local Library Audio File is missing or damaged.")
+            resolved_headphones_folder = self._resolve_headphones_folder(headphones_folder)
+            self.filesystem.ensure_headphones_folder(resolved_headphones_folder)
+            return OperationResult(
+                [
+                    self._transfer_audio_record(
+                        record,
+                        audio_path,
+                        resolved_headphones_folder,
+                        on_progress=on_progress,
+                    )
+                ]
+            )
+        except Exception as exc:
+            return OperationResult(
+                [
+                    TransferOutcome(
+                        status=TransferStatus.ERROR,
+                        title=record.title,
+                        source_url=record.source_url or None,
+                        message=str(exc),
+                    )
+                ]
+            )
 
     def transfer_one(self, url: str, headphones_folder: Path | None = None) -> OperationResult:
         return self.run([url], headphones_folder)
@@ -355,6 +448,15 @@ class Workflow:
         on_progress: ProgressCallback | None,
         cancel_token: CancelToken | None,
     ) -> TransferOutcome:
+        local_settings = self.settings.load_local_library()
+        if local_settings.enabled:
+            return self._process_one_keep_local(
+                item,
+                headphones_folder,
+                on_progress,
+                local_settings,
+                cancel_token,
+            )
         url = self._source_url(item).strip()
         title_hint = self._source_title(item)
         if self._is_cancelled(cancel_token):
@@ -486,6 +588,155 @@ class Workflow:
             title = locals().get("source_item").title if "source_item" in locals() else title_hint
             if "filename" in locals():
                 self._remove_incomplete_transfer_artifacts(resolved_headphones_folder, locals()["filename"])
+            return TransferOutcome(
+                status=TransferStatus.ERROR,
+                title=title,
+                source_url=url,
+                audio_path=locals().get("audio_path"),
+                message=str(exc),
+            )
+
+    def _process_one_keep_local(
+        self,
+        item: SourceInput,
+        headphones_folder: Path | None,
+        on_progress: ProgressCallback | None,
+        local_settings: LocalLibrarySettings,
+        cancel_token: CancelToken | None,
+    ) -> TransferOutcome:
+        url = self._source_url(item).strip()
+        title_hint = self._source_title(item)
+        if self._is_cancelled(cancel_token):
+            return self._cancelled_outcome(item)
+        if not self._is_supported_public_url(url):
+            return TransferOutcome(
+                status=TransferStatus.ERROR,
+                title=title_hint,
+                source_url=url,
+                message="Enter a public YouTube or SoundCloud URL.",
+            )
+
+        try:
+            local_library = self._require_local_library(local_settings)
+            self.workspace.mkdir(parents=True, exist_ok=True)
+            source_item = self._resolve_source_item(item, url)
+            if self._is_cancelled(cancel_token):
+                return self._cancelled_outcome(source_item)
+            record = self.state_store.get(source_item.source_id)
+            if record is not None:
+                audio_path = local_library / record.filename
+                if self._matches_record(audio_path, record):
+                    try:
+                        resolved_headphones_folder = self._resolve_headphones_folder(headphones_folder)
+                        self.filesystem.ensure_headphones_folder(resolved_headphones_folder)
+                    except Exception:
+                        return TransferOutcome(
+                            status=TransferStatus.DOWNLOADED,
+                            title=record.title,
+                            source_url=record.source_url or url,
+                            audio_path=audio_path,
+                            message="Downloaded Audio File",
+                        )
+                    return self._transfer_audio_record(
+                        record,
+                        audio_path,
+                        resolved_headphones_folder,
+                        on_progress=on_progress,
+                        cancel_token=cancel_token,
+                    )
+
+            filename = self._transfer_filename(source_item, local_library)
+            audio_path = local_library / filename
+            extracted_item, extracted_path = self._extract(url, self.workspace / "extracted", cancel_token)
+            if self._is_cancelled(cancel_token):
+                return self._cancelled_outcome(source_item)
+            source_item = SourceItem(
+                source_id=source_item.source_id,
+                url=url,
+                title=extracted_item.title or source_item.title,
+                duration_seconds=extracted_item.duration_seconds or source_item.duration_seconds,
+            )
+            media_info = self.encoder.encode_mp3(extracted_path, audio_path)
+            if not media_info.is_stereo_192kbps_mp3:
+                return TransferOutcome(
+                    status=TransferStatus.ERROR,
+                    title=source_item.title,
+                    source_url=url,
+                    message="Audio File is not a stereo 192 kbps MP3.",
+                )
+            probed_info = self.encoder.probe(audio_path)
+            if not probed_info.is_stereo_192kbps_mp3:
+                return TransferOutcome(
+                    status=TransferStatus.ERROR,
+                    title=source_item.title,
+                    source_url=url,
+                    audio_path=audio_path,
+                    message="Encoded Audio File failed artifact verification.",
+                )
+            record = TransferRecord(
+                source_id=source_item.source_id,
+                title=source_item.title,
+                filename=filename,
+                byte_size=audio_path.stat().st_size,
+                sha256=self._sha256(audio_path),
+                source_url=url,
+                status=LOCAL_TRANSFER,
+            )
+            self.state_store.save(record)
+            downloaded = TransferOutcome(
+                status=TransferStatus.DOWNLOADED,
+                title=source_item.title,
+                source_url=url,
+                audio_path=audio_path,
+                message="Downloaded Audio File",
+            )
+            if on_progress is not None:
+                on_progress(downloaded)
+            if self._is_cancelled(cancel_token):
+                return self._cancelled_outcome(source_item, audio_path=audio_path)
+            try:
+                resolved_headphones_folder = self._resolve_headphones_folder(headphones_folder)
+                self.filesystem.ensure_headphones_folder(resolved_headphones_folder)
+            except Exception:
+                return downloaded
+            return self._transfer_audio_record(
+                record,
+                audio_path,
+                resolved_headphones_folder,
+                on_progress=on_progress,
+                cancel_token=cancel_token,
+            )
+        except OperationCancelled as exc:
+            title = locals().get("source_item").title if "source_item" in locals() else title_hint
+            if "resolved_headphones_folder" in locals() and "filename" in locals():
+                self._remove_incomplete_transfer_artifacts(
+                    locals()["resolved_headphones_folder"],
+                    locals()["filename"],
+                )
+            if "resolved_headphones_folder" in locals() and "record" in locals():
+                self._remove_incomplete_transfer_artifacts(
+                    locals()["resolved_headphones_folder"],
+                    locals()["record"].filename,
+                )
+            return TransferOutcome(
+                status=TransferStatus.CANCELLED,
+                title=title,
+                source_url=url,
+                audio_path=locals().get("audio_path"),
+                message=str(exc) or "Cancelled.",
+            )
+        except Exception as exc:
+            title = locals().get("source_item").title if "source_item" in locals() else title_hint
+            if "resolved_headphones_folder" in locals() and "filename" in locals():
+                self._remove_incomplete_transfer_artifacts(
+                    locals()["resolved_headphones_folder"],
+                    locals()["filename"],
+                )
+            if "resolved_headphones_folder" in locals() and "record" in locals():
+                self._remove_incomplete_transfer_artifacts(
+                    locals()["resolved_headphones_folder"],
+                    locals()["record"].filename,
+                )
             return TransferOutcome(
                 status=TransferStatus.ERROR,
                 title=title,
@@ -691,6 +942,39 @@ class Workflow:
                 message=str(exc),
             )
 
+    def _transfer_audio_record(
+        self,
+        record: TransferRecord,
+        audio_path: Path,
+        headphones_folder: Path,
+        on_progress: ProgressCallback | None,
+        cancel_token: CancelToken | None = None,
+    ) -> TransferOutcome:
+        transfer_path = headphones_folder / record.filename
+        if self._matches_record(transfer_path, record):
+            self._save_completed_record(record, transfer_path)
+            return TransferOutcome(
+                status=TransferStatus.ALREADY_PRESENT,
+                title=record.title,
+                source_url=record.source_url or None,
+                audio_path=audio_path,
+                transfer_path=transfer_path,
+                message="Already present",
+            )
+        transferred_path = self._transfer_verified(audio_path, headphones_folder, record.filename, cancel_token)
+        self._save_completed_record(record, transferred_path)
+        transferred = TransferOutcome(
+            status=TransferStatus.TRANSFERRED,
+            title=record.title,
+            source_url=record.source_url or None,
+            audio_path=audio_path,
+            transfer_path=transferred_path,
+            message="Transferred",
+        )
+        if on_progress is not None:
+            on_progress(transferred)
+        return transferred
+
     def _save_completed_record(self, record: TransferRecord, transfer_path: Path) -> None:
         self.state_store.save(
             TransferRecord(
@@ -706,6 +990,23 @@ class Workflow:
 
     def _recovery_audio_path(self, filename: str) -> Path:
         return self.workspace / "recovery" / filename
+
+    def _require_local_library(self, settings: LocalLibrarySettings | None = None) -> Path:
+        settings = settings or self.settings.load_local_library()
+        if not settings.enabled or settings.path is None:
+            raise ValueError("Choose a Local Library before keeping local MP3s.")
+        self._ensure_local_library(settings.path)
+        return settings.path
+
+    def _ensure_local_library(self, local_library: Path) -> None:
+        if not local_library.exists() or not local_library.is_dir():
+            raise ValueError("Choose an existing Local Library before keeping local MP3s.")
+        probe = local_library / ".swimtunes-write-test"
+        try:
+            probe.write_bytes(b"")
+            probe.unlink(missing_ok=True)
+        except OSError as exc:
+            raise ValueError("Local Library is not writable.") from exc
 
     def _matches_record(self, path: Path, record: TransferRecord) -> bool:
         return path.exists() and path.stat().st_size == record.byte_size and self._sha256(path) == record.sha256

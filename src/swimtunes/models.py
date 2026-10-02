@@ -91,6 +91,22 @@ class HeadphonesFolderSelection:
     device_identity: HeadphonesDeviceIdentity
 
 
+@dataclass(frozen=True)
+class LocalLibrarySettings:
+    enabled: bool = False
+    path: Path | None = None
+
+
+@dataclass(frozen=True)
+class LocalAudioFile:
+    source_id: str
+    title: str
+    source_url: str | None
+    path: Path
+    byte_size: int
+    sha256: str
+
+
 class TransferStatus(Enum):
     DOWNLOADED = "downloaded"
     TRANSFERRED = "transferred"

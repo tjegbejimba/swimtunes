@@ -1,6 +1,14 @@
 from pathlib import Path
 
-from swimtunes.models import OperationResult, SelectionSpaceSummary, TransferOutcome, TransferRecord, TransferStatus
+from swimtunes.models import (
+    LocalAudioFile,
+    LocalLibrarySettings,
+    OperationResult,
+    SelectionSpaceSummary,
+    TransferOutcome,
+    TransferRecord,
+    TransferStatus,
+)
 
 
 class FakeWorkflow:
@@ -263,6 +271,94 @@ def test_gui_confirms_repair_before_overwriting_damaged_pending_transfer(
     app.processEvents()
 
     assert workflow.retry_calls == [False, True]
+    assert "Transferred: Lane Mix" in window.output.toPlainText()
+    window.close()
+    app.processEvents()
+
+
+def test_gui_persists_keep_local_toggle_and_lists_local_audio_for_later_transfer(
+    artifact_dir: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication, QFileDialog, QPushButton
+    from swimtunes.gui import _build_main_window
+
+    app = QApplication.instance() or QApplication([])
+    local_library = artifact_dir / "local-library"
+    local_library.mkdir()
+    headphones_folder = artifact_dir / "headphones"
+    headphones_folder.mkdir()
+
+    class LocalLibraryWorkflow:
+        settings = None
+
+        def __init__(self) -> None:
+            self.local_settings = LocalLibrarySettings(enabled=False, path=None)
+            self.configure_calls = []
+            self.transfer_local_calls = []
+
+        def pending_transfers(self):
+            return []
+
+        def local_library_settings(self):
+            return self.local_settings
+
+        def configure_local_library(self, enabled: bool, path: Path | None, headphones_folder: Path | None = None):
+            self.configure_calls.append((enabled, path, headphones_folder))
+            self.local_settings = LocalLibrarySettings(enabled=enabled, path=path if enabled else None)
+            return OperationResult(
+                [
+                    TransferOutcome(
+                        status=TransferStatus.TRANSFERRED,
+                        message="Local Library settings saved.",
+                    )
+                ]
+            )
+
+        def local_audio_files(self):
+            if not self.local_settings.enabled or self.local_settings.path is None:
+                return []
+            return [
+                LocalAudioFile(
+                    source_id="yt:test-video",
+                    title="Lane Mix",
+                    source_url="https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+                    path=self.local_settings.path / "Lane Mix--a63668cb.mp3",
+                    byte_size=20,
+                    sha256="abc",
+                )
+            ]
+
+        def transfer_local_audio(self, source_id: str, headphones_folder: Path, on_progress=None):
+            self.transfer_local_calls.append((source_id, headphones_folder))
+            return OperationResult(
+                [
+                    TransferOutcome(
+                        status=TransferStatus.TRANSFERRED,
+                        title="Lane Mix",
+                        transfer_path=headphones_folder / "Lane Mix--a63668cb.mp3",
+                    )
+                ]
+            )
+
+    monkeypatch.setattr(QFileDialog, "getExistingDirectory", lambda *args, **kwargs: str(local_library))
+    workflow = LocalLibraryWorkflow()
+    window = _build_main_window()(workflow)
+    window.headphones_folder = headphones_folder
+
+    assert window.keep_local_checkbox.isChecked() is False
+
+    window.keep_local_checkbox.setChecked(True)
+
+    assert workflow.configure_calls == [(True, local_library, headphones_folder)]
+    assert "Local Library: " in window.local_library_label.text()
+    buttons = window.local_library_container.findChildren(QPushButton)
+    assert [button.text() for button in buttons] == ["Transfer"]
+
+    buttons[0].click()
+
+    assert workflow.transfer_local_calls == [("yt:test-video", headphones_folder)]
     assert "Transferred: Lane Mix" in window.output.toPlainText()
     window.close()
     app.processEvents()

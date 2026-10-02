@@ -70,6 +70,8 @@ def _build_main_window():
             for outcome in result.outcomes:
                 if outcome.status is TransferStatus.TRANSFERRED:
                     lines.append(f"Transferred: {outcome.title} -> {outcome.transfer_path}")
+                elif outcome.status is TransferStatus.ALREADY_PRESENT:
+                    lines.append(f"Already present: {outcome.title} -> {outcome.transfer_path}")
                 else:
                     label = outcome.title or outcome.source_url or "Source Item"
                     lines.append(f"Error: {label}: {outcome.message}")

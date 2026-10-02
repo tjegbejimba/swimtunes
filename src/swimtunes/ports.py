@@ -3,10 +3,13 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Protocol
 
-from swimtunes.models import MediaInfo, SourceItem
+from swimtunes.models import MediaInfo, SourceItem, TransferRecord
 
 
 class Extractor(Protocol):
+    def resolve(self, url: str) -> SourceItem:
+        """Resolve stable Source Item metadata without downloading media."""
+
     def extract(self, url: str, work_dir: Path) -> tuple[SourceItem, Path]:
         """Extract a public Source Item and return metadata plus the local media path."""
 
@@ -28,3 +31,14 @@ class FileSystem(Protocol):
 
     def transfer_verified(self, source: Path, headphones_folder: Path, filename: str) -> Path:
         """Copy, fsync, verify, and atomically complete a Transfer."""
+
+
+class TransferStateStore(Protocol):
+    def get(self, source_id: str) -> TransferRecord | None:
+        """Return the latest completed Transfer record for a stable Source Item."""
+
+    def save(self, record: TransferRecord) -> None:
+        """Persist a completed Transfer record."""
+
+    def all(self) -> list[TransferRecord]:
+        """Return known completed Transfer records."""

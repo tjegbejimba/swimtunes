@@ -38,6 +38,7 @@ class AudioFile:
 
 class TransferStatus(Enum):
     TRANSFERRED = "transferred"
+    ALREADY_PRESENT = "already_present"
     ERROR = "error"
 
 
@@ -57,5 +58,15 @@ class OperationResult:
     @property
     def ok(self) -> bool:
         return bool(self.outcomes) and all(
-            outcome.status is TransferStatus.TRANSFERRED for outcome in self.outcomes
+            outcome.status in {TransferStatus.TRANSFERRED, TransferStatus.ALREADY_PRESENT}
+            for outcome in self.outcomes
         )
+
+
+@dataclass(frozen=True)
+class TransferRecord:
+    source_id: str
+    title: str
+    filename: str
+    byte_size: int
+    sha256: str

@@ -6,7 +6,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "PySide6>=6.8,<7",
-    "yt-dlp>=2026.1.1,<2027",
+    "yt-dlp==2026.8.19",
 ]
 
 [project.scripts]
@@ -14,6 +14,7 @@ swimtunes = "swimtunes.gui:main"
 
 [dependency-groups]
 dev = [
+    "pyinstaller>=6.11,<7",
     "pytest>=8.3,<9",
 ]
 

@@ -17,7 +17,6 @@ def _build_main_window():
         QFileDialog,
         QHBoxLayout,
         QLabel,
-        QLineEdit,
         QMainWindow,
         QPushButton,
         QTextEdit,
@@ -32,8 +31,9 @@ def _build_main_window():
             self.headphones_folder: Path | None = None
             self.setWindowTitle("SwimTunes")
 
-            self.url_input = QLineEdit()
-            self.url_input.setPlaceholderText("Paste one public YouTube URL")
+            self.url_input = QTextEdit()
+            self.url_input.setAcceptRichText(False)
+            self.url_input.setPlaceholderText("Paste public YouTube or SoundCloud URLs, one per line")
             self.folder_label = QLabel("No Headphones Folder selected")
             choose_button = QPushButton("Choose Headphones Folder")
             choose_button.clicked.connect(self.choose_headphones_folder)
@@ -47,7 +47,7 @@ def _build_main_window():
             folder_row.addWidget(choose_button)
 
             layout = QVBoxLayout()
-            layout.addWidget(QLabel("Source Item URL"))
+            layout.addWidget(QLabel("Source Item URLs"))
             layout.addWidget(self.url_input)
             layout.addLayout(folder_row)
             layout.addWidget(transfer_button)
@@ -66,13 +66,36 @@ def _build_main_window():
             if self.headphones_folder is None:
                 self.output.setPlainText("Choose a Headphones Folder before starting.")
                 return
-            result = self.workflow.transfer_one(self.url_input.text(), self.headphones_folder)
-            lines = []
-            for outcome in result.outcomes:
-                if outcome.status is TransferStatus.TRANSFERRED:
-                    lines.append(f"Transferred: {outcome.title} -> {outcome.transfer_path}")
-                else:
+            urls = [
+                line.strip()
+                for line in self.url_input.toPlainText().splitlines()
+                if line.strip()
+            ]
+            if not urls:
+                self.output.setPlainText("Paste at least one Source Item URL before starting.")
+                return
+            lines: list[str] = []
+
+            transferred_labels: set[str] = set()
+
+            def record_progress(outcome) -> None:
+                if outcome.status is TransferStatus.DOWNLOADED:
                     label = outcome.title or outcome.source_url or "Source Item"
+                    lines.append(f"Downloaded: {label} -> {outcome.audio_path}")
+                    self.output.setPlainText("\n".join(lines))
+                elif outcome.status is TransferStatus.TRANSFERRED:
+                    label = outcome.title or outcome.source_url or "Source Item"
+                    transferred_labels.add(label)
+                    lines.append(f"Transferred: {label} -> {outcome.transfer_path}")
+                    self.output.setPlainText("\n".join(lines))
+
+            result = self.workflow.run(urls, self.headphones_folder, on_progress=record_progress)
+            for outcome in result.outcomes:
+                label = outcome.title or outcome.source_url or "Source Item"
+                if outcome.status is TransferStatus.TRANSFERRED:
+                    if label not in transferred_labels:
+                        lines.append(f"Transferred: {label} -> {outcome.transfer_path}")
+                else:
                     lines.append(f"Error: {label}: {outcome.message}")
             self.output.setPlainText("\n".join(lines))
 

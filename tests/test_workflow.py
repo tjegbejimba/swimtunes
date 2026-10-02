@@ -5,13 +5,15 @@ from swimtunes.models import MediaInfo, SourceItem, TransferStatus
 
 
 class RecordingExtractor:
-    def __init__(self, source_media: Path) -> None:
+    def __init__(self, source_media: Path, titles: dict[str, str] | None = None) -> None:
         self.source_media = source_media
+        self.titles = titles or {}
         self.calls: list[str] = []
 
     def extract(self, url: str, work_dir: Path):
         self.calls.append(url)
-        return SourceItem(source_id="yt:test-video", url=url, title="Lane Mix"), self.source_media
+        title = self.titles.get(url, "Lane Mix")
+        return SourceItem(source_id=f"source:{title}", url=url, title=title), self.source_media
 
 
 class WritingEncoder:
@@ -28,12 +30,16 @@ class WritingEncoder:
 
 
 class FailingExtractor:
-    def __init__(self) -> None:
+    def __init__(self, failed_urls: set[str] | None = None, source_media: Path | None = None) -> None:
+        self.failed_urls = failed_urls
+        self.source_media = source_media
         self.calls: list[str] = []
 
     def extract(self, url: str, work_dir: Path):
         self.calls.append(url)
-        raise RuntimeError("public Source Item is unavailable")
+        if self.failed_urls is None or url in self.failed_urls:
+            raise RuntimeError("public Source Item is unavailable")
+        return SourceItem(source_id="source:ok", url=url, title="Successful Track"), self.source_media
 
 
 class FailingFilesystem:
@@ -156,3 +162,68 @@ def test_default_workspace_uses_per_user_app_data_dir() -> None:
 
     assert workflow.workspace != Path.cwd() / ".swimtunes-work"
     assert "SwimTunes" in workflow.workspace.parts
+
+
+def test_batch_run_reports_each_source_item_independently(artifact_dir: Path) -> None:
+    source_media = artifact_dir / "source.webm"
+    source_media.write_bytes(b"source media")
+    headphones_folder = artifact_dir / "headphones"
+    headphones_folder.mkdir()
+    youtube_url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ&list=incidental"
+    soundcloud_url = "https://soundcloud.com/swimmer/lane-mix"
+    selected_source = SourceItem(
+        source_id="soundcloud:lane-mix",
+        url=soundcloud_url,
+        title="Lane Mix",
+    )
+    bad_url = "https://example.com/not-supported"
+    failing_url = "https://soundcloud.com/swimmer/removed-track"
+    extractor = FailingExtractor(failed_urls={failing_url}, source_media=source_media)
+    workflow = Workflow(
+        extractor=extractor,
+        encoder=WritingEncoder(),
+        workspace=artifact_dir / "workspace",
+    )
+
+    result = workflow.run([youtube_url, bad_url, selected_source, failing_url], headphones_folder)
+
+    assert result.ok is False
+    assert [outcome.status for outcome in result.outcomes] == [
+        TransferStatus.TRANSFERRED,
+        TransferStatus.ERROR,
+        TransferStatus.TRANSFERRED,
+        TransferStatus.ERROR,
+    ]
+    assert extractor.calls == [youtube_url, soundcloud_url, failing_url]
+    assert "public YouTube or SoundCloud URL" in result.outcomes[1].message
+    assert "unavailable" in result.outcomes[3].message
+
+
+def test_batch_progress_distinguishes_downloaded_audio_file_from_transfer(
+    artifact_dir: Path,
+) -> None:
+    source_media = artifact_dir / "source.webm"
+    source_media.write_bytes(b"source media")
+    headphones_folder = artifact_dir / "headphones"
+    headphones_folder.mkdir()
+    workflow = Workflow(
+        extractor=RecordingExtractor(source_media),
+        encoder=WritingEncoder(),
+        workspace=artifact_dir / "workspace",
+    )
+    progress = []
+
+    result = workflow.run(
+        ["https://soundcloud.com/swimmer/lane-mix"],
+        headphones_folder,
+        on_progress=progress.append,
+    )
+
+    assert result.ok is True
+    assert [event.status for event in progress] == [
+        TransferStatus.DOWNLOADED,
+        TransferStatus.TRANSFERRED,
+    ]
+    assert progress[0].message == "Downloaded Audio File"
+    assert progress[0].audio_path == artifact_dir / "workspace" / "audio" / "Lane Mix.mp3"
+    assert progress[1].transfer_path == headphones_folder / "Lane Mix.mp3"

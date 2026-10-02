@@ -324,7 +324,7 @@ class Workflow:
             return parsed.path == "/watch" and bool(parse_qs(parsed.query).get("v"))
         if host in {"soundcloud.com", "www.soundcloud.com"}:
             parts = [part for part in parsed.path.split("/") if part]
-            return len(parts) >= 2 and parts[0] != "sets"
+            return len(parts) >= 2 and parts[1] != "sets"
         return False
 
     def _is_explicit_source_playlist_url(self, url: str) -> bool:
@@ -334,6 +334,9 @@ class Workflow:
         host = parsed.hostname.lower() if parsed.hostname else ""
         if host in {"youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com"}:
             return parsed.path == "/playlist" and bool(parse_qs(parsed.query).get("list"))
+        if host in {"soundcloud.com", "www.soundcloud.com"}:
+            parts = [part for part in parsed.path.split("/") if part]
+            return len(parts) >= 3 and parts[1] == "sets"
         return False
 
     def _remove_incomplete_transfer_artifacts(self, headphones_folder: Path, filename: str) -> None:

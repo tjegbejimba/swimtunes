@@ -5,10 +5,13 @@ import hashlib
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+from swimtunes.adapters.device_identity import platform_device_identity_adapter
 from swimtunes.adapters.ffmpeg import FfmpegMediaAdapter
 from swimtunes.adapters.filesystem import LocalFilesystemAdapter
+from swimtunes.adapters.settings import JsonSettingsStore
 from swimtunes.adapters.ytdlp import YtDlpExtractor
 from swimtunes.models import (
+    HeadphonesFolderSelection,
     OperationResult,
     SourceItem,
     SourcePlaylist,
@@ -18,7 +21,7 @@ from swimtunes.models import (
     TransferStatus,
 )
 from swimtunes.paths import default_workspace
-from swimtunes.ports import Encoder, Extractor, FileSystem, TransferStateStore
+from swimtunes.ports import DeviceIdentity, Encoder, Extractor, FileSystem, SettingsStore, TransferStateStore
 from swimtunes.state import JsonTransferStateStore
 
 ProgressCallback = Callable[[TransferOutcome], None]
@@ -31,22 +34,48 @@ class Workflow:
         extractor: Extractor | None = None,
         encoder: Encoder | None = None,
         filesystem: FileSystem | None = None,
+        settings: SettingsStore | None = None,
+        device_identity: DeviceIdentity | None = None,
         workspace: Path | None = None,
         state_store: TransferStateStore | None = None,
     ) -> None:
         self.extractor = extractor or YtDlpExtractor()
         self.encoder = encoder or FfmpegMediaAdapter()
         self.filesystem = filesystem or LocalFilesystemAdapter()
+        self.settings = settings or JsonSettingsStore()
+        self.device_identity = device_identity or platform_device_identity_adapter()
         self.workspace = workspace or default_workspace()
         self.state_store = state_store or JsonTransferStateStore(self.workspace / "transfer-state.json")
 
-    def transfer_one(self, url: str, headphones_folder: Path) -> OperationResult:
+    def choose_headphones_folder(self, headphones_folder: Path) -> OperationResult:
+        try:
+            self.filesystem.ensure_headphones_folder(headphones_folder)
+            identity = self.device_identity.identity_for(headphones_folder)
+            if identity is None:
+                raise ValueError(
+                    "Headphones Device identity could not be verified; reselect a "
+                    "verifiable Headphones Folder before transferring."
+                )
+            self.settings.save_headphones_folder(
+                HeadphonesFolderSelection(path=headphones_folder, device_identity=identity)
+            )
+            return OperationResult([
+                TransferOutcome(
+                    status=TransferStatus.TRANSFERRED,
+                    transfer_path=headphones_folder,
+                    message="Headphones Folder selected.",
+                )
+            ])
+        except Exception as exc:
+            return OperationResult([TransferOutcome(status=TransferStatus.ERROR, message=str(exc))])
+
+    def transfer_one(self, url: str, headphones_folder: Path | None = None) -> OperationResult:
         return self.run([url], headphones_folder)
 
     def run(
         self,
         items: Iterable[SourceInput],
-        headphones_folder: Path,
+        headphones_folder: Path | None = None,
         on_progress: ProgressCallback | None = None,
     ) -> OperationResult:
         outcomes: list[TransferOutcome] = []
@@ -69,7 +98,7 @@ class Workflow:
     def transfer_selected(
         self,
         entries: list[SourcePlaylistEntry],
-        headphones_folder: Path,
+        headphones_folder: Path | None = None,
         on_progress: ProgressCallback | None = None,
     ) -> OperationResult:
         outcomes: list[TransferOutcome] = []
@@ -97,13 +126,13 @@ class Workflow:
             outcomes.extend(self.run([entry], headphones_folder, on_progress).outcomes)
         return OperationResult(outcomes)
 
-    def transfer_many(self, urls: list[str], headphones_folder: Path) -> OperationResult:
+    def transfer_many(self, urls: list[str], headphones_folder: Path | None = None) -> OperationResult:
         return self.run(urls, headphones_folder)
 
     def _process_one(
         self,
         item: SourceInput,
-        headphones_folder: Path,
+        headphones_folder: Path | None,
         on_progress: ProgressCallback | None,
     ) -> TransferOutcome:
         url = self._source_url(item).strip()
@@ -117,7 +146,8 @@ class Workflow:
             )
 
         try:
-            self.filesystem.ensure_headphones_folder(headphones_folder)
+            resolved_headphones_folder = self._resolve_headphones_folder(headphones_folder)
+            self.filesystem.ensure_headphones_folder(resolved_headphones_folder)
         except Exception as exc:
             return TransferOutcome(
                 status=TransferStatus.ERROR,
@@ -129,7 +159,7 @@ class Workflow:
         try:
             self.workspace.mkdir(parents=True, exist_ok=True)
             source_item = self._resolve_source_item(item, url)
-            existing = self._existing_record_outcome(source_item, headphones_folder)
+            existing = self._existing_record_outcome(source_item, resolved_headphones_folder)
             if existing is not None:
                 return existing
 
@@ -139,7 +169,7 @@ class Workflow:
                 url=url,
                 title=extracted_item.title or source_item.title,
             )
-            filename = self._transfer_filename(source_item, headphones_folder)
+            filename = self._transfer_filename(source_item, resolved_headphones_folder)
             audio_path = self.workspace / "audio" / filename
             audio_path.parent.mkdir(parents=True, exist_ok=True)
             media_info = self.encoder.encode_mp3(extracted_path, audio_path)
@@ -168,7 +198,7 @@ class Workflow:
             )
             if on_progress is not None:
                 on_progress(downloaded)
-            transfer_path = self.filesystem.transfer_verified(audio_path, headphones_folder, filename)
+            transfer_path = self.filesystem.transfer_verified(audio_path, resolved_headphones_folder, filename)
             self.state_store.save(
                 TransferRecord(
                     source_id=source_item.source_id,
@@ -192,7 +222,7 @@ class Workflow:
         except Exception as exc:
             title = locals().get("source_item").title if "source_item" in locals() else title_hint
             if "filename" in locals():
-                self._remove_incomplete_transfer_artifacts(headphones_folder, locals()["filename"])
+                self._remove_incomplete_transfer_artifacts(resolved_headphones_folder, locals()["filename"])
             return TransferOutcome(
                 status=TransferStatus.ERROR,
                 title=title,
@@ -250,6 +280,38 @@ class Workflow:
                 path.unlink(missing_ok=True)
             except OSError:
                 pass
+
+    def _resolve_headphones_folder(self, requested_folder: Path | None) -> Path:
+        selection = self.settings.load_headphones_folder()
+        if requested_folder is not None:
+            if selection is None:
+                return requested_folder
+            if selection.path != requested_folder:
+                raise ValueError("Reselect this Headphones Folder in settings before transferring.")
+            return self._verified_or_reconciled_folder(selection)
+
+        if selection is None:
+            raise ValueError("Choose a Headphones Folder before starting.")
+        return self._verified_or_reconciled_folder(selection)
+
+    def _verified_or_reconciled_folder(self, selection: HeadphonesFolderSelection) -> Path:
+        current_identity = self.device_identity.identity_for(selection.path)
+        if current_identity == selection.device_identity:
+            return selection.path
+
+        reconciled = self.device_identity.find_folder(selection.device_identity, selection.path)
+        if reconciled is not None:
+            reconciled_selection = HeadphonesFolderSelection(
+                path=reconciled,
+                device_identity=selection.device_identity,
+            )
+            self.settings.save_headphones_folder(reconciled_selection)
+            return reconciled
+
+        raise ValueError(
+            "Headphones Device identity could not be verified; reselect the "
+            "Headphones Folder before transferring."
+        )
 
     def _existing_record_outcome(
         self,

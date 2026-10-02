@@ -28,7 +28,11 @@ def _build_main_window():
         def __init__(self, workflow: Workflow | None = None) -> None:
             super().__init__()
             self.workflow = workflow or Workflow()
-            self.headphones_folder: Path | None = None
+            selection = None
+            settings = getattr(self.workflow, "settings", None)
+            if settings is not None:
+                selection = settings.load_headphones_folder()
+            self.headphones_folder: Path | None = selection.path if selection else None
             self.playlist_entries = []
             self.playlist_checkboxes = []
             self.setWindowTitle("SwimTunes")
@@ -36,7 +40,11 @@ def _build_main_window():
             self.url_input = QTextEdit()
             self.url_input.setAcceptRichText(False)
             self.url_input.setPlaceholderText("Paste public YouTube or SoundCloud URLs, one per line")
-            self.folder_label = QLabel("No Headphones Folder selected")
+            self.folder_label = QLabel(
+                str(self.headphones_folder)
+                if self.headphones_folder
+                else "No Headphones Folder selected"
+            )
             choose_button = QPushButton("Choose Headphones Folder")
             choose_button.clicked.connect(self.choose_headphones_folder)
             preview_button = QPushButton("Preview Playlist")
@@ -68,8 +76,13 @@ def _build_main_window():
         def choose_headphones_folder(self) -> None:
             selected = QFileDialog.getExistingDirectory(self, "Choose Headphones Folder")
             if selected:
-                self.headphones_folder = Path(selected)
-                self.folder_label.setText(selected)
+                result = self.workflow.choose_headphones_folder(Path(selected))
+                if result.ok:
+                    self.headphones_folder = Path(selected)
+                    self.folder_label.setText(selected)
+                    self.output.setPlainText("Headphones Folder selected.")
+                else:
+                    self.output.setPlainText(result.outcomes[0].message)
 
         def preview(self) -> None:
             playlist = self.workflow.preview(self.url_input.toPlainText())

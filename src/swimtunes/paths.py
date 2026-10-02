@@ -16,3 +16,7 @@ def default_workspace() -> Path:
         base = os.environ.get("XDG_DATA_HOME") or (Path.home() / ".local" / "share")
         root = Path(base) / app_name
     return root / "workspace"
+
+
+def default_settings_path() -> Path:
+    return default_workspace().parent / "settings.json"

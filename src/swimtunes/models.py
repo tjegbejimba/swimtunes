@@ -57,6 +57,18 @@ class AudioFile:
     media_info: MediaInfo
 
 
+@dataclass(frozen=True)
+class HeadphonesDeviceIdentity:
+    kind: str
+    stable_id: str
+
+
+@dataclass(frozen=True)
+class HeadphonesFolderSelection:
+    path: Path
+    device_identity: HeadphonesDeviceIdentity
+
+
 class TransferStatus(Enum):
     DOWNLOADED = "downloaded"
     TRANSFERRED = "transferred"

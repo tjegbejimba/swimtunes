@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from swimtunes.adapters.ffmpeg import FfmpegMediaAdapter
 from swimtunes.adapters.filesystem import LocalFilesystemAdapter
 from swimtunes.adapters.ytdlp import YtDlpExtractor
 from swimtunes.models import OperationResult, TransferOutcome, TransferStatus
+from swimtunes.paths import default_workspace
 from swimtunes.ports import Encoder, Extractor, FileSystem
 
 
@@ -21,7 +22,7 @@ class Workflow:
         self.extractor = extractor or YtDlpExtractor()
         self.encoder = encoder or FfmpegMediaAdapter()
         self.filesystem = filesystem or LocalFilesystemAdapter()
-        self.workspace = workspace or (Path.cwd() / ".swimtunes-work")
+        self.workspace = workspace or default_workspace()
 
     def transfer_one(self, url: str, headphones_folder: Path) -> OperationResult:
         url = url.strip()
@@ -83,6 +84,8 @@ class Workflow:
             ])
         except Exception as exc:
             title = locals().get("source_item").title if "source_item" in locals() else None
+            if "filename" in locals():
+                self._remove_incomplete_transfer_artifacts(headphones_folder, locals()["filename"])
             return OperationResult([
                 TransferOutcome(
                     status=TransferStatus.ERROR,
@@ -96,8 +99,19 @@ class Workflow:
         parsed = urlparse(url)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             return False
-        host = parsed.netloc.lower()
-        return any(
-            domain in host
-            for domain in ("youtube.com", "youtu.be", "music.youtube.com", "soundcloud.com")
-        )
+        host = parsed.hostname.lower() if parsed.hostname else ""
+        if host == "youtu.be":
+            return bool(parsed.path.strip("/"))
+        if host in {"youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com"}:
+            return parsed.path == "/watch" and bool(parse_qs(parsed.query).get("v"))
+        return False
+
+    def _remove_incomplete_transfer_artifacts(self, headphones_folder: Path, filename: str) -> None:
+        for path in (
+            headphones_folder / filename,
+            headphones_folder / f"{filename}.incomplete",
+        ):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass

@@ -17,6 +17,7 @@ class MediaInfo:
     codec: str
     channels: int
     bit_rate: int
+    is_cbr: bool
 
     @property
     def is_stereo_192kbps_mp3(self) -> bool:
@@ -24,6 +25,7 @@ class MediaInfo:
             self.codec.lower() == "mp3"
             and self.channels == 2
             and 188_000 <= self.bit_rate <= 196_000
+            and self.is_cbr
         )
 
 

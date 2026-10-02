@@ -5,7 +5,7 @@ import subprocess
 from pathlib import Path
 
 from swimtunes.models import MediaInfo
-from swimtunes.tools import bundled_root, resolve_required_tools
+from swimtunes.tools import bundled_root, resolve_tool
 
 
 _BITRATES_KBPS = {
@@ -22,9 +22,8 @@ _SAMPLE_RATES = {
 
 class FfmpegMediaAdapter:
     def __init__(self, ffmpeg: str | Path | None = None, ffprobe: str | Path | None = None) -> None:
-        tools = resolve_required_tools(bundle_root=bundled_root()) if ffmpeg is None or ffprobe is None else None
-        self.ffmpeg = str(ffmpeg or tools.ffmpeg)
-        self.ffprobe = str(ffprobe or tools.ffprobe)
+        self.ffmpeg = str(ffmpeg) if ffmpeg is not None else None
+        self.ffprobe = str(ffprobe) if ffprobe is not None else None
 
     def encode_mp3(self, source_media: Path, output_path: Path) -> MediaInfo:
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -169,3 +168,23 @@ class FfmpegMediaAdapter:
         xing_marker = data[frame_start + xing_offset : frame_start + xing_offset + 4]
         vbri_marker = data[frame_start + 36 : frame_start + 40]
         return xing_marker in {b"Xing", b"Info"} or vbri_marker == b"VBRI"
+
+    @property
+    def ffmpeg(self) -> str:
+        if self._ffmpeg is None:
+            self._ffmpeg = str(resolve_tool("ffmpeg", bundle_root=bundled_root()))
+        return self._ffmpeg
+
+    @ffmpeg.setter
+    def ffmpeg(self, value: str | None) -> None:
+        self._ffmpeg = value
+
+    @property
+    def ffprobe(self) -> str:
+        if self._ffprobe is None:
+            self._ffprobe = str(resolve_tool("ffprobe", bundle_root=bundled_root()))
+        return self._ffprobe
+
+    @ffprobe.setter
+    def ffprobe(self, value: str | None) -> None:
+        self._ffprobe = value

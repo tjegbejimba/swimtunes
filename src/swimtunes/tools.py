@@ -46,10 +46,20 @@ def resolve_required_tools(
 ) -> ToolPaths:
     platform = platform or sys.platform
     return ToolPaths(
-        ffmpeg=_resolve_tool("ffmpeg", bundle_root, path_env, platform),
-        ffprobe=_resolve_tool("ffprobe", bundle_root, path_env, platform),
-        yt_dlp=_resolve_tool("yt-dlp", bundle_root, path_env, platform),
+        ffmpeg=resolve_tool("ffmpeg", bundle_root=bundle_root, path_env=path_env, platform=platform),
+        ffprobe=resolve_tool("ffprobe", bundle_root=bundle_root, path_env=path_env, platform=platform),
+        yt_dlp=resolve_tool("yt-dlp", bundle_root=bundle_root, path_env=path_env, platform=platform),
     )
+
+
+def resolve_tool(
+    name: str,
+    *,
+    bundle_root: Path | None = None,
+    path_env: str | None = None,
+    platform: str | None = None,
+) -> Path:
+    return _resolve_tool(name, bundle_root, path_env, platform or sys.platform)
 
 
 def self_check(

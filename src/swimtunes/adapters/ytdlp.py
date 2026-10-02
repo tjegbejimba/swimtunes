@@ -5,14 +5,12 @@ import subprocess
 from pathlib import Path
 
 from swimtunes.models import SourceItem
-from swimtunes.tools import bundled_root, resolve_required_tools
+from swimtunes.tools import bundled_root, resolve_tool
 
 
 class YtDlpExtractor:
     def __init__(self, yt_dlp: str | Path | None = None) -> None:
-        if yt_dlp is None:
-            yt_dlp = resolve_required_tools(bundle_root=bundled_root()).yt_dlp
-        self.yt_dlp = str(yt_dlp)
+        self.yt_dlp = str(yt_dlp) if yt_dlp is not None else None
 
     def extract(self, url: str, work_dir: Path) -> tuple[SourceItem, Path]:
         work_dir.mkdir(parents=True, exist_ok=True)
@@ -50,3 +48,13 @@ class YtDlpExtractor:
                 return Path(filepath)
         filename = f"{info.get('extractor') or 'source'}-{info.get('id')}.{info.get('ext')}"
         return work_dir / filename
+
+    @property
+    def yt_dlp(self) -> str:
+        if self._yt_dlp is None:
+            self._yt_dlp = str(resolve_tool("yt-dlp", bundle_root=bundled_root()))
+        return self._yt_dlp
+
+    @yt_dlp.setter
+    def yt_dlp(self, value: str | None) -> None:
+        self._yt_dlp = value

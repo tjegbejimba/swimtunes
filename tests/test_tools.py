@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 from swimtunes.tools import resolve_required_tools, self_check
@@ -26,14 +27,16 @@ def test_bundled_tool_resolution_prefers_frozen_bundle(artifact_dir: Path) -> No
 def test_dev_tool_resolution_falls_back_to_path(artifact_dir: Path) -> None:
     bin_dir = artifact_dir / "bin"
     bin_dir.mkdir()
-    ffmpeg = bin_dir / "ffmpeg"
-    ffprobe = bin_dir / "ffprobe"
-    ytdlp = bin_dir / "yt-dlp"
+    suffix = ".exe" if os.name == "nt" else ""
+    platform = "win32" if os.name == "nt" else "linux"
+    ffmpeg = bin_dir / f"ffmpeg{suffix}"
+    ffprobe = bin_dir / f"ffprobe{suffix}"
+    ytdlp = bin_dir / f"yt-dlp{suffix}"
     for path in (ffmpeg, ffprobe, ytdlp):
         path.write_text("placeholder", encoding="utf-8")
         path.chmod(0o755)
 
-    resolved = resolve_required_tools(bundle_root=None, path_env=str(bin_dir), platform="linux")
+    resolved = resolve_required_tools(bundle_root=None, path_env=str(bin_dir), platform=platform)
 
     assert resolved.ffmpeg == ffmpeg
     assert resolved.ffprobe == ffprobe

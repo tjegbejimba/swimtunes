@@ -34,6 +34,15 @@ def _build_main_window():
             if settings is not None:
                 selection = settings.load_headphones_folder()
             self.headphones_folder: Path | None = selection.path if selection else None
+            local_settings_getter = getattr(self.workflow, "local_library_settings", None)
+            self.local_library_settings = (
+                local_settings_getter() if local_settings_getter is not None else None
+            )
+            self.local_library_path: Path | None = (
+                self.local_library_settings.path
+                if self.local_library_settings is not None and self.local_library_settings.enabled
+                else None
+            )
             self.playlist_entries = []
             self.playlist_checkboxes = []
             self.setWindowTitle("SwimTunes")
@@ -48,6 +57,18 @@ def _build_main_window():
             )
             choose_button = QPushButton("Choose Headphones Folder")
             choose_button.clicked.connect(self.choose_headphones_folder)
+            self.keep_local_checkbox = QCheckBox("Keep local MP3s")
+            self.keep_local_checkbox.setChecked(
+                bool(self.local_library_settings and self.local_library_settings.enabled)
+            )
+            self.keep_local_checkbox.toggled.connect(self._toggle_keep_local)
+            self.local_library_label = QLabel(
+                f"Local Library: {self.local_library_path}"
+                if self.local_library_path
+                else "No Local Library selected"
+            )
+            choose_local_button = QPushButton("Choose Local Library")
+            choose_local_button.clicked.connect(self.choose_local_library)
             preview_button = QPushButton("Preview Playlist")
             preview_button.clicked.connect(self.preview)
             self.transfer_button = QPushButton("Transfer")
@@ -58,12 +79,18 @@ def _build_main_window():
             self.pending_container = QWidget()
             self.pending_layout = QVBoxLayout()
             self.pending_container.setLayout(self.pending_layout)
+            self.local_library_container = QWidget()
+            self.local_library_layout = QVBoxLayout()
+            self.local_library_container.setLayout(self.local_library_layout)
             self.output = QTextEdit()
             self.output.setReadOnly(True)
 
             folder_row = QHBoxLayout()
             folder_row.addWidget(self.folder_label, 1)
             folder_row.addWidget(choose_button)
+            local_row = QHBoxLayout()
+            local_row.addWidget(self.local_library_label, 1)
+            local_row.addWidget(choose_local_button)
 
             layout = QVBoxLayout()
             layout.addWidget(QLabel("Source Item URLs"))
@@ -73,12 +100,17 @@ def _build_main_window():
             layout.addWidget(QLabel("Pending Transfers"))
             layout.addWidget(self.pending_container)
             layout.addLayout(folder_row)
+            layout.addWidget(self.keep_local_checkbox)
+            layout.addLayout(local_row)
+            layout.addWidget(QLabel("Local Library Audio Files"))
+            layout.addWidget(self.local_library_container)
             layout.addWidget(self.transfer_button)
             layout.addWidget(self.output)
             container = QWidget()
             container.setLayout(layout)
             self.setCentralWidget(container)
             self._refresh_pending_transfers()
+            self._refresh_local_library_audio()
 
         def choose_headphones_folder(self) -> None:
             selected = QFileDialog.getExistingDirectory(self, "Choose Headphones Folder")
@@ -90,6 +122,49 @@ def _build_main_window():
                     self.output.setPlainText("Headphones Folder selected.")
                 else:
                     self.output.setPlainText(result.outcomes[0].message)
+
+        def choose_local_library(self) -> None:
+            selected = QFileDialog.getExistingDirectory(self, "Choose Local Library")
+            if selected:
+                self._save_local_library_settings(True, Path(selected))
+
+        def _toggle_keep_local(self, checked: bool) -> None:
+            if checked:
+                if self.local_library_path is None:
+                    selected = QFileDialog.getExistingDirectory(self, "Choose Local Library")
+                    if not selected:
+                        self.keep_local_checkbox.blockSignals(True)
+                        self.keep_local_checkbox.setChecked(False)
+                        self.keep_local_checkbox.blockSignals(False)
+                        return
+                    self._save_local_library_settings(True, Path(selected))
+                else:
+                    self._save_local_library_settings(True, self.local_library_path)
+            else:
+                self._save_local_library_settings(False, None)
+
+        def _save_local_library_settings(self, enabled: bool, path: Path | None) -> None:
+            configure = getattr(self.workflow, "configure_local_library", None)
+            if configure is None:
+                return
+            result = configure(enabled, path, headphones_folder=self.headphones_folder)
+            if result.ok:
+                self.local_library_path = path if enabled else None
+                self.local_library_label.setText(
+                    f"Local Library: {self.local_library_path}"
+                    if self.local_library_path
+                    else "No Local Library selected"
+                )
+                self.output.setPlainText(result.outcomes[0].message)
+                self.keep_local_checkbox.blockSignals(True)
+                self.keep_local_checkbox.setChecked(enabled)
+                self.keep_local_checkbox.blockSignals(False)
+                self._refresh_local_library_audio()
+            else:
+                self.output.setPlainText(result.outcomes[0].message)
+                self.keep_local_checkbox.blockSignals(True)
+                self.keep_local_checkbox.setChecked(False)
+                self.keep_local_checkbox.blockSignals(False)
 
         def preview(self) -> None:
             playlist = self.workflow.preview(self.url_input.toPlainText())
@@ -111,7 +186,7 @@ def _build_main_window():
             self._update_transfer_enabled()
 
         def transfer(self) -> None:
-            if self.headphones_folder is None:
+            if self.headphones_folder is None and not self.keep_local_checkbox.isChecked():
                 self.output.setPlainText("Choose a Headphones Folder before starting.")
                 return
             selected_entries = self._selected_playlist_entries()
@@ -149,6 +224,7 @@ def _build_main_window():
             self._append_final_outcomes(result.outcomes, lines, transferred_labels)
             self.output.setPlainText("\n".join(lines))
             self._refresh_pending_transfers()
+            self._refresh_local_library_audio()
 
         def _clear_playlist_preview(self) -> None:
             while self.preview_layout.count():
@@ -193,6 +269,43 @@ def _build_main_window():
                 )
                 row_layout.addWidget(retry_button)
                 self.pending_layout.addWidget(row)
+
+        def _refresh_local_library_audio(self) -> None:
+            while self.local_library_layout.count():
+                item = self.local_library_layout.takeAt(0)
+                widget = item.widget()
+                if widget is not None:
+                    widget.setParent(None)
+                    widget.deleteLater()
+            local_getter = getattr(self.workflow, "local_audio_files", None)
+            if local_getter is None:
+                return
+            for audio in local_getter():
+                row = QWidget()
+                row_layout = QHBoxLayout()
+                row.setLayout(row_layout)
+                row_layout.addWidget(QLabel(audio.title), 1)
+                transfer_button = QPushButton("Transfer")
+                transfer_button.clicked.connect(
+                    lambda checked=False, source_id=audio.source_id: self._transfer_local_audio(source_id)
+                )
+                row_layout.addWidget(transfer_button)
+                self.local_library_layout.addWidget(row)
+
+        def _transfer_local_audio(self, source_id: str) -> None:
+            if self.headphones_folder is None:
+                self.output.setPlainText("Choose a Headphones Folder before starting.")
+                return
+            lines: list[str] = []
+            transferred_labels: set[str] = set()
+            result = self.workflow.transfer_local_audio(
+                source_id,
+                self.headphones_folder,
+                on_progress=lambda outcome: self._record_progress(outcome, lines, transferred_labels),
+            )
+            self._append_final_outcomes(result.outcomes, lines, transferred_labels)
+            self.output.setPlainText("\n".join(lines))
+            self._refresh_local_library_audio()
 
         def _retry_pending_transfer(self, source_id: str, confirm_repair: bool = False) -> None:
             if self.headphones_folder is None:
@@ -244,6 +357,8 @@ def _build_main_window():
                         lines.append(f"Transferred: {label} -> {outcome.transfer_path}")
                 elif outcome.status is TransferStatus.ALREADY_PRESENT:
                     lines.append(f"Already present: {label} -> {outcome.transfer_path}")
+                elif outcome.status is TransferStatus.DOWNLOADED:
+                    lines.append(f"Downloaded: {label} -> {outcome.audio_path}")
                 elif outcome.status is TransferStatus.REPAIR_NEEDED:
                     lines.append(f"Repair needed: {label}: {outcome.message}")
                 else:

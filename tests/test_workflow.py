@@ -588,3 +588,134 @@ def test_retry_pending_damaged_destination_requires_confirmation_before_repair(
 
     assert repaired.ok is True
     assert damaged_destination.read_bytes() == b"verified mp3 payload"
+
+
+def test_keep_local_defaults_off_and_unplugged_transfer_blocks_before_extraction(
+    artifact_dir: Path,
+) -> None:
+    extractor = RecordingExtractor(artifact_dir / "unused.webm")
+    workflow = Workflow(
+        extractor=extractor,
+        encoder=WritingEncoder(),
+        settings=JsonSettingsStore(artifact_dir / "settings.json"),
+        workspace=artifact_dir / "workspace",
+    )
+
+    assert workflow.local_library_settings().enabled is False
+
+    result = workflow.transfer_one("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+
+    assert result.ok is False
+    assert extractor.calls == []
+    assert result.outcomes[0].status is TransferStatus.ERROR
+    assert "Headphones Folder" in result.outcomes[0].message
+
+
+def test_enabling_keep_local_requires_separate_existing_local_library_and_persists(
+    artifact_dir: Path,
+) -> None:
+    headphones_folder = artifact_dir / "headphones"
+    headphones_folder.mkdir()
+    local_library = artifact_dir / "local-library"
+    local_library.mkdir()
+    settings = JsonSettingsStore(artifact_dir / "settings.json")
+    workflow = Workflow(settings=settings, workspace=artifact_dir / "workspace")
+
+    missing = workflow.configure_local_library(True, artifact_dir / "missing-library")
+    assert missing.ok is False
+    assert "Local Library" in missing.outcomes[0].message
+
+    same_as_headphones = workflow.configure_local_library(
+        True,
+        headphones_folder,
+        headphones_folder=headphones_folder,
+    )
+    assert same_as_headphones.ok is False
+    assert "separate" in same_as_headphones.outcomes[0].message
+
+    enabled = workflow.configure_local_library(True, local_library, headphones_folder=headphones_folder)
+    assert enabled.ok is True
+
+    reloaded = Workflow(settings=settings, workspace=artifact_dir / "workspace").local_library_settings()
+    assert reloaded.enabled is True
+    assert reloaded.path == local_library
+
+
+def test_keep_local_downloads_while_unplugged_and_transfers_later_without_redownloading(
+    artifact_dir: Path,
+) -> None:
+    source_media = artifact_dir / "source.webm"
+    source_media.write_bytes(b"source media")
+    local_library = artifact_dir / "local-library"
+    local_library.mkdir()
+    headphones_folder = artifact_dir / "headphones"
+    headphones_folder.mkdir()
+    settings = JsonSettingsStore(artifact_dir / "settings.json")
+    state = JsonTransferStateStore(artifact_dir / "state" / "transfers.json")
+    extractor = RecordingExtractor(source_media)
+    workflow = Workflow(
+        extractor=extractor,
+        encoder=WritingEncoder(),
+        filesystem=RecordingFilesystem(),
+        settings=settings,
+        workspace=artifact_dir / "workspace",
+        state_store=state,
+    )
+    assert workflow.configure_local_library(True, local_library).ok is True
+
+    downloaded = workflow.transfer_one("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+
+    assert downloaded.ok is False
+    assert downloaded.outcomes[0].status is TransferStatus.DOWNLOADED
+    assert downloaded.outcomes[0].audio_path == local_library / "Lane Mix--a63668cb.mp3"
+    assert downloaded.outcomes[0].audio_path.read_bytes() == b"verified mp3 payload"
+    assert list(headphones_folder.iterdir()) == []
+    local_files = workflow.local_audio_files()
+    assert [audio.source_id for audio in local_files] == ["yt:test-video"]
+    assert local_files[0].path == local_library / "Lane Mix--a63668cb.mp3"
+
+    retry_extractor = RecordingExtractor(source_media)
+    retry_filesystem = RecordingFilesystem()
+    restarted = Workflow(
+        extractor=retry_extractor,
+        encoder=WritingEncoder(),
+        filesystem=retry_filesystem,
+        settings=settings,
+        workspace=artifact_dir / "workspace-2",
+        state_store=state,
+    )
+
+    transferred = restarted.transfer_local_audio("yt:test-video", headphones_folder)
+
+    assert transferred.ok is True
+    assert transferred.outcomes[0].status is TransferStatus.TRANSFERRED
+    assert transferred.outcomes[0].transfer_path == headphones_folder / "Lane Mix--a63668cb.mp3"
+    assert retry_extractor.calls == []
+    assert retry_filesystem.transfers == [
+        (local_library / "Lane Mix--a63668cb.mp3", headphones_folder, "Lane Mix--a63668cb.mp3")
+    ]
+
+
+def test_enabled_keep_local_reports_missing_library_instead_of_falling_back(
+    artifact_dir: Path,
+) -> None:
+    source_media = artifact_dir / "source.webm"
+    source_media.write_bytes(b"source media")
+    local_library = artifact_dir / "local-library"
+    local_library.mkdir()
+    settings = JsonSettingsStore(artifact_dir / "settings.json")
+    workflow = Workflow(
+        extractor=RecordingExtractor(source_media),
+        encoder=WritingEncoder(),
+        settings=settings,
+        workspace=artifact_dir / "workspace",
+    )
+    assert workflow.configure_local_library(True, local_library).ok is True
+    local_library.rmdir()
+
+    result = workflow.transfer_one("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+
+    assert result.ok is False
+    assert result.outcomes[0].status is TransferStatus.ERROR
+    assert "Local Library" in result.outcomes[0].message
+    assert not (artifact_dir / "workspace" / "recovery").exists()

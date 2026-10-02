@@ -1,0 +1,116 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - tjegbejimba-ubiquitous-robot
+      - t11
+  pull_request:
+
+jobs:
+  tests:
+    name: Tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install FFmpeg for media-shape tests (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ffmpeg
+      - name: Install FFmpeg for media-shape tests (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: choco install ffmpeg -y --no-progress
+      - name: Run tests
+        run: uv run pytest -q
+
+  windows-portable:
+    name: Windows portable app
+    runs-on: windows-latest
+    needs: tests
+    if: github.event_name == 'push'
+    env:
+      YTDLP_VERSION: '2026.08.19'
+      YTDLP_URL: 'https://github.com/yt-dlp/yt-dlp/releases/download/2026.08.19/yt-dlp.exe'
+      YTDLP_SHA256: '66674953fe251b89f4d08c5f0e35e0728679bd67ab3d7d05c0562af101dd3e7a'
+      FFMPEG_VERSION: '9.0.2'
+      FFMPEG_URL: 'https://github.com/GyanD/codexffmpeg/releases/download/9.0.2/ffmpeg-9.0.2-essentials_build.zip'
+      FFMPEG_SHA256: '60f467265b1e312373dbcd92200c2618a74850f98d3d078e94296bb3fa2047ba'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Download pinned tools
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force build/windows/downloads, build/windows/tools | Out-Null
+
+          $ytDlpDownload = 'build/windows/downloads/yt-dlp.exe'
+          Invoke-WebRequest -Uri $env:YTDLP_URL -OutFile $ytDlpDownload
+          $ytDlpHash = (Get-FileHash $ytDlpDownload -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($ytDlpHash -ne $env:YTDLP_SHA256) { throw "yt-dlp SHA256 mismatch: $ytDlpHash" }
+          Copy-Item $ytDlpDownload build/windows/tools/yt-dlp.exe
+
+          $ffmpegDownload = 'build/windows/downloads/ffmpeg.zip'
+          Invoke-WebRequest -Uri $env:FFMPEG_URL -OutFile $ffmpegDownload
+          $ffmpegHash = (Get-FileHash $ffmpegDownload -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($ffmpegHash -ne $env:FFMPEG_SHA256) { throw "FFmpeg SHA256 mismatch: $ffmpegHash" }
+          Expand-Archive -Path $ffmpegDownload -DestinationPath build/windows/ffmpeg-unpack -Force
+          $ffmpegRoot = Get-ChildItem build/windows/ffmpeg-unpack -Directory | Select-Object -First 1
+          Copy-Item "$($ffmpegRoot.FullName)/bin/ffmpeg.exe" build/windows/tools/ffmpeg.exe
+          Copy-Item "$($ffmpegRoot.FullName)/bin/ffprobe.exe" build/windows/tools/ffprobe.exe
+          Copy-Item docs/third-party.md build/windows/tools/THIRD_PARTY_NOTICES.md
+
+          $manifest = [ordered]@{
+            generated_by = 'github-actions/windows-portable'
+            tools = [ordered]@{
+              'yt-dlp' = [ordered]@{
+                version = $env:YTDLP_VERSION
+                origin = $env:YTDLP_URL
+                sha256 = $env:YTDLP_SHA256
+                license = 'Unlicense'
+              }
+              ffmpeg = [ordered]@{
+                version = $env:FFMPEG_VERSION
+                origin = $env:FFMPEG_URL
+                sha256 = $env:FFMPEG_SHA256
+                build = 'Gyan.dev essentials build for Windows x64'
+                license = 'GPLv3-or-later aggregate build; see THIRD_PARTY_NOTICES.md'
+              }
+            }
+          }
+          $manifest | ConvertTo-Json -Depth 8 | Set-Content -Encoding UTF8 build/windows/tools/TOOL_MANIFEST.json
+      - name: Build onedir bundle
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          uv run pyinstaller --noconfirm --clean --name SwimTunes --onedir --windowed --hidden-import PySide6.QtWidgets --add-data 'build/windows/tools;tools' src/swimtunes/gui.py
+          Copy-Item docs/third-party.md dist/SwimTunes/THIRD_PARTY_NOTICES.md
+          Copy-Item build/windows/tools/TOOL_MANIFEST.json dist/SwimTunes/TOOL_MANIFEST.json
+      - name: Smoke launch bundle self-check
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $process = Start-Process -FilePath dist/SwimTunes/SwimTunes.exe -ArgumentList '--self-check' -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "SwimTunes self-check failed with $($process.ExitCode)" }
+      - name: Upload internal portable artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SwimTunes-windows-x64-portable-internal
+          path: dist/SwimTunes
+          if-no-files-found: error

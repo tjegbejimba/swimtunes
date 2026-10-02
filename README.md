@@ -29,4 +29,8 @@ uv run pytest
 uv run swimtunes
 ```
 
+## Portable Windows development artifact
+
+GitHub Actions runs `uv run pytest -q` on macOS and Windows. Pushes also build an internal Windows x64 PyInstaller onedir folder with pinned yt-dlp and FFmpeg binaries downloaded in CI from exact URLs and verified by SHA256. The bundle includes `tools/TOOL_MANIFEST.json` and `THIRD_PARTY_NOTICES.md`, and CI smoke-runs `SwimTunes.exe --self-check` to verify the frozen app can resolve its bundled tools without a system Python install. This artifact is internal only and is not uploaded to any public release repository.
+
 Tests must not hit live YouTube or SoundCloud. Workflow tests inject deterministic adapters at `swimtunes.app.Workflow`; real media-shape coverage uses locally generated `ffmpeg` fixtures and `ffprobe`.

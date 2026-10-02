@@ -6,6 +6,7 @@ from pathlib import Path
 
 from swimtunes.app import SimpleCancelToken, Workflow
 from swimtunes.models import SelectionSpaceSummary, TransferStatus
+from swimtunes.tools import self_check
 
 
 class MainWindow:  # populated at runtime after PySide6 import succeeds
@@ -365,6 +366,13 @@ def _build_main_window():
 
 
 def main() -> int:
+    if "--self-check" in sys.argv:
+        report = self_check()
+        if report.ok:
+            return 0
+        print(report.message, file=sys.stderr)
+        return 1
+
     from PySide6.QtWidgets import QApplication
 
     app = QApplication(sys.argv)

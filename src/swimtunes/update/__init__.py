@@ -18,6 +18,7 @@ from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 from swimtunes import __version__
+from swimtunes import _release_config
 from swimtunes.paths import default_workspace
 
 
@@ -354,8 +355,8 @@ class WindowsAuthenticodePublisherVerifier:
 
 
 def default_update_checker() -> UpdateChecker | None:
-    public_key = os.environ.get("SWIMTUNES_UPDATE_PUBLIC_KEY")
-    publisher = os.environ.get("SWIMTUNES_UPDATE_PUBLISHER")
+    public_key = os.environ.get("SWIMTUNES_UPDATE_PUBLIC_KEY") or _release_config.UPDATE_PUBLIC_KEY
+    publisher = os.environ.get("SWIMTUNES_UPDATE_PUBLISHER") or _release_config.UPDATE_PUBLISHER
     if not public_key or not publisher:
         return None
     return UpdateChecker(
@@ -365,7 +366,7 @@ def default_update_checker() -> UpdateChecker | None:
             expected_publisher=publisher,
         ),
         feed=GitHubReleaseFeed(
-            repository=os.environ.get("SWIMTUNES_UPDATE_REPOSITORY", PUBLIC_RELEASE_REPOSITORY),
+            repository=os.environ.get("SWIMTUNES_UPDATE_REPOSITORY", _release_config.UPDATE_REPOSITORY),
         ),
         publisher_verifier=WindowsAuthenticodePublisherVerifier(),
     )

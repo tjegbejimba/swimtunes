@@ -20,6 +20,8 @@ Before any friend-facing release, choose an FFmpeg build with suitable license t
 
 macOS tests do not establish Windows playback or headphones compatibility. No actual Windows/headphones test is available yet, so the first release must say **beta** and must not claim verified playback. YouTube extraction is unofficial and YouTube's terms restrict third-party downloading; a public URL is not permission to bypass those terms. See [ADR 0003](docs/adr/0003-unofficial-extraction-boundary.md).
 
+The human release checklist lives in [docs/release.md](docs/release.md). It covers signing identity setup, Ed25519 update keys, the protected `release` environment, scoped public-repository token, dry-run review, live feed verification, and the beta/no-playback-claim requirement.
+
 ## Development
 
 Use `uv` from the repository root:

@@ -106,8 +106,8 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          & dist/SwimTunes/SwimTunes.exe --self-check
-          if ($LASTEXITCODE -ne 0) { throw "SwimTunes self-check failed with $LASTEXITCODE" }
+          $process = Start-Process -FilePath dist/SwimTunes/SwimTunes.exe -ArgumentList '--self-check' -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "SwimTunes self-check failed with $($process.ExitCode)" }
       - name: Upload internal portable artifact
         uses: actions/upload-artifact@v4
         with:

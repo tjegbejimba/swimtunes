@@ -18,6 +18,7 @@ def _build_main_window():
         QCheckBox,
         QLabel,
         QMainWindow,
+        QMessageBox,
         QPushButton,
         QTextEdit,
         QVBoxLayout,
@@ -54,6 +55,9 @@ def _build_main_window():
             self.preview_container = QWidget()
             self.preview_layout = QVBoxLayout()
             self.preview_container.setLayout(self.preview_layout)
+            self.pending_container = QWidget()
+            self.pending_layout = QVBoxLayout()
+            self.pending_container.setLayout(self.pending_layout)
             self.output = QTextEdit()
             self.output.setReadOnly(True)
 
@@ -66,12 +70,15 @@ def _build_main_window():
             layout.addWidget(self.url_input)
             layout.addWidget(preview_button)
             layout.addWidget(self.preview_container)
+            layout.addWidget(QLabel("Pending Transfers"))
+            layout.addWidget(self.pending_container)
             layout.addLayout(folder_row)
             layout.addWidget(self.transfer_button)
             layout.addWidget(self.output)
             container = QWidget()
             container.setLayout(layout)
             self.setCentralWidget(container)
+            self._refresh_pending_transfers()
 
         def choose_headphones_folder(self) -> None:
             selected = QFileDialog.getExistingDirectory(self, "Choose Headphones Folder")
@@ -139,16 +146,9 @@ def _build_main_window():
                     self.output.setPlainText("\n".join(lines))
 
             result = transfer(items, self.headphones_folder, on_progress=record_progress)
-            for outcome in result.outcomes:
-                label = outcome.title or outcome.source_url or "Source Item"
-                if outcome.status is TransferStatus.TRANSFERRED:
-                    if label not in transferred_labels:
-                        lines.append(f"Transferred: {label} -> {outcome.transfer_path}")
-                elif outcome.status is TransferStatus.ALREADY_PRESENT:
-                    lines.append(f"Already present: {label} -> {outcome.transfer_path}")
-                else:
-                    lines.append(f"Error: {label}: {outcome.message}")
+            self._append_final_outcomes(result.outcomes, lines, transferred_labels)
             self.output.setPlainText("\n".join(lines))
+            self._refresh_pending_transfers()
 
         def _clear_playlist_preview(self) -> None:
             while self.preview_layout.count():
@@ -171,6 +171,83 @@ def _build_main_window():
                 self.transfer_button.setEnabled(bool(self._selected_playlist_entries()))
             else:
                 self.transfer_button.setEnabled(True)
+
+        def _refresh_pending_transfers(self) -> None:
+            while self.pending_layout.count():
+                item = self.pending_layout.takeAt(0)
+                widget = item.widget()
+                if widget is not None:
+                    widget.setParent(None)
+                    widget.deleteLater()
+            pending_getter = getattr(self.workflow, "pending_transfers", None)
+            if pending_getter is None:
+                return
+            for record in pending_getter():
+                row = QWidget()
+                row_layout = QHBoxLayout()
+                row.setLayout(row_layout)
+                row_layout.addWidget(QLabel(record.title), 1)
+                retry_button = QPushButton("Retry")
+                retry_button.clicked.connect(
+                    lambda checked=False, source_id=record.source_id: self._retry_pending_transfer(source_id)
+                )
+                row_layout.addWidget(retry_button)
+                self.pending_layout.addWidget(row)
+
+        def _retry_pending_transfer(self, source_id: str, confirm_repair: bool = False) -> None:
+            if self.headphones_folder is None:
+                self.output.setPlainText("Choose a Headphones Folder before starting.")
+                return
+            lines: list[str] = []
+            transferred_labels: set[str] = set()
+            result = self.workflow.retry_pending(
+                source_id,
+                self.headphones_folder,
+                on_progress=lambda outcome: self._record_progress(outcome, lines, transferred_labels),
+                confirm_repair=confirm_repair,
+            )
+            if (
+                result.outcomes
+                and result.outcomes[0].status is TransferStatus.REPAIR_NEEDED
+                and not confirm_repair
+            ):
+                answer = QMessageBox.question(
+                    self,
+                    "Repair Transfer?",
+                    result.outcomes[0].message,
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                )
+                if answer == QMessageBox.StandardButton.Yes:
+                    self._retry_pending_transfer(source_id, confirm_repair=True)
+                else:
+                    self.output.setPlainText(result.outcomes[0].message)
+                return
+            self._append_final_outcomes(result.outcomes, lines, transferred_labels)
+            self.output.setPlainText("\n".join(lines))
+            self._refresh_pending_transfers()
+
+        def _record_progress(self, outcome, lines: list[str], transferred_labels: set[str]) -> None:
+            label = outcome.title or outcome.source_url or "Source Item"
+            if outcome.status is TransferStatus.DOWNLOADED:
+                lines.append(f"Downloaded: {label} -> {outcome.audio_path}")
+                self.output.setPlainText("\n".join(lines))
+            elif outcome.status is TransferStatus.TRANSFERRED:
+                transferred_labels.add(label)
+                lines.append(f"Transferred: {label} -> {outcome.transfer_path}")
+                self.output.setPlainText("\n".join(lines))
+
+        def _append_final_outcomes(self, outcomes, lines: list[str], transferred_labels: set[str]) -> None:
+            for outcome in outcomes:
+                label = outcome.title or outcome.source_url or "Source Item"
+                if outcome.status is TransferStatus.TRANSFERRED:
+                    if label not in transferred_labels:
+                        lines.append(f"Transferred: {label} -> {outcome.transfer_path}")
+                elif outcome.status is TransferStatus.ALREADY_PRESENT:
+                    lines.append(f"Already present: {label} -> {outcome.transfer_path}")
+                elif outcome.status is TransferStatus.REPAIR_NEEDED:
+                    lines.append(f"Repair needed: {label}: {outcome.message}")
+                else:
+                    lines.append(f"Error: {label}: {outcome.message}")
 
     return SwimTunesWindow
 

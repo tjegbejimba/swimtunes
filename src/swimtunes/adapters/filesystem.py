@@ -3,7 +3,10 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import shutil
 from pathlib import Path
+
+from swimtunes.ports import CancelToken, OperationCancelled
 
 
 class LocalFilesystemAdapter:
@@ -16,7 +19,13 @@ class LocalFilesystemAdapter:
         stem = re.sub(r"\s+", " ", stem)[:120].strip()
         return f"{stem or 'Audio File'}.mp3"
 
-    def transfer_verified(self, source: Path, headphones_folder: Path, filename: str) -> Path:
+    def transfer_verified(
+        self,
+        source: Path,
+        headphones_folder: Path,
+        filename: str,
+        cancel_token: CancelToken | None = None,
+    ) -> Path:
         self.ensure_headphones_folder(headphones_folder)
         destination = (headphones_folder / filename).resolve()
         root = headphones_folder.resolve()
@@ -27,20 +36,32 @@ class LocalFilesystemAdapter:
         source_hash = self._sha256(source)
         source_size = source.stat().st_size
 
-        with source.open("rb") as src, incomplete.open("wb") as dst:
-            while chunk := src.read(1024 * 1024):
-                dst.write(chunk)
-            dst.flush()
-            os.fsync(dst.fileno())
+        try:
+            with source.open("rb") as src, incomplete.open("wb") as dst:
+                while chunk := src.read(1024 * 1024):
+                    if cancel_token is not None and cancel_token.is_cancelled:
+                        raise OperationCancelled("Transfer cancelled.")
+                    dst.write(chunk)
+                if cancel_token is not None and cancel_token.is_cancelled:
+                    raise OperationCancelled("Transfer cancelled.")
+                dst.flush()
+                os.fsync(dst.fileno())
 
-        if incomplete.stat().st_size != source_size or self._sha256(incomplete) != source_hash:
+            if incomplete.stat().st_size != source_size or self._sha256(incomplete) != source_hash:
+                incomplete.unlink(missing_ok=True)
+                raise IOError("Transfer verification failed before completion.")
+        except Exception:
             incomplete.unlink(missing_ok=True)
-            raise IOError("Transfer verification failed before completion.")
+            raise
 
         os.replace(incomplete, destination)
         if destination.stat().st_size != source_size or self._sha256(destination) != source_hash:
             raise IOError("Completed Transfer verification failed.")
         return destination
+
+    def free_bytes(self, folder: Path) -> int | None:
+        self.ensure_headphones_folder(folder)
+        return shutil.disk_usage(folder).free
 
     def _sha256(self, path: Path) -> str:
         digest = hashlib.sha256()

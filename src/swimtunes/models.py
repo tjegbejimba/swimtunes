@@ -10,6 +10,7 @@ class SourceItem:
     source_id: str
     url: str
     title: str
+    duration_seconds: float | None = None
 
 
 @dataclass(frozen=True)
@@ -19,6 +20,27 @@ class SourcePlaylistEntry:
     title: str
     available: bool = True
     error: str | None = None
+    duration_seconds: float | None = None
+
+
+@dataclass(frozen=True)
+class SelectionSpaceSummary:
+    item_count: int
+    estimated_bytes: int | None
+    free_bytes: int | None
+    unknown_size_count: int = 0
+
+    @property
+    def has_uncertainty(self) -> bool:
+        return self.estimated_bytes is None or self.free_bytes is None or self.unknown_size_count > 0
+
+    @property
+    def known_to_fit(self) -> bool:
+        return self.estimated_bytes is not None and self.free_bytes is not None and self.estimated_bytes <= self.free_bytes
+
+    @property
+    def known_too_large(self) -> bool:
+        return self.estimated_bytes is not None and self.free_bytes is not None and self.estimated_bytes > self.free_bytes
 
 
 @dataclass(frozen=True)
@@ -90,6 +112,7 @@ class TransferStatus(Enum):
     TRANSFERRED = "transferred"
     ALREADY_PRESENT = "already_present"
     REPAIR_NEEDED = "repair_needed"
+    CANCELLED = "cancelled"
     ERROR = "error"
 
 

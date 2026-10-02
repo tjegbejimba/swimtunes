@@ -4,6 +4,7 @@ from pathlib import Path
 from swimtunes.app import Workflow
 from swimtunes.adapters.settings import JsonSettingsStore
 from swimtunes.models import HeadphonesDeviceIdentity, MediaInfo, SourceItem, TransferStatus
+from swimtunes.ports import OperationCancelled
 from swimtunes.state import JsonTransferStateStore
 
 
@@ -13,10 +14,12 @@ class RecordingExtractor:
         source_media: Path,
         source_item: SourceItem | None = None,
         titles: dict[str, str] | None = None,
+        durations: dict[str, float | None] | None = None,
     ) -> None:
         self.source_media = source_media
         self.source_item = source_item
         self.titles = titles or {}
+        self.durations = durations or {}
         self.resolve_calls: list[str] = []
         self.calls: list[str] = []
 
@@ -32,7 +35,7 @@ class RecordingExtractor:
         if self.source_item is not None:
             return SourceItem(source_id=self.source_item.source_id, url=url, title=self.source_item.title)
         title = self.titles.get(url, "Lane Mix")
-        return SourceItem(source_id="yt:test-video", url=url, title=title)
+        return SourceItem(source_id="yt:test-video", url=url, title=title, duration_seconds=self.durations.get(url))
 
 
 class WritingEncoder:
@@ -93,8 +96,9 @@ class UnpluggedMidCopyFilesystem(FailingFilesystem):
 
 
 class RecordingFilesystem:
-    def __init__(self) -> None:
+    def __init__(self, free_bytes: int | None = None) -> None:
         self.transfers: list[tuple[Path, Path, str]] = []
+        self._free_bytes = free_bytes
 
     def ensure_headphones_folder(self, folder: Path) -> None:
         if not folder.exists():
@@ -108,6 +112,9 @@ class RecordingFilesystem:
         destination = headphones_folder / filename
         destination.write_bytes(source.read_bytes())
         return destination
+
+    def free_bytes(self, folder: Path) -> int | None:
+        return self._free_bytes
 
 
 class FakeDeviceIdentity:
@@ -588,3 +595,157 @@ def test_retry_pending_damaged_destination_requires_confirmation_before_repair(
 
     assert repaired.ok is True
     assert damaged_destination.read_bytes() == b"verified mp3 payload"
+
+
+class ManualCancelToken:
+    def __init__(self, cancelled: bool = False) -> None:
+        self._cancelled = cancelled
+
+    @property
+    def is_cancelled(self) -> bool:
+        return self._cancelled
+
+    def cancel(self) -> None:
+        self._cancelled = True
+
+
+class CancellingExtractor(RecordingExtractor):
+    def __init__(self, source_media: Path, cancel_token: ManualCancelToken) -> None:
+        super().__init__(source_media)
+        self.cancel_token = cancel_token
+
+    def extract(self, url: str, work_dir: Path, cancel_token=None):
+        self.calls.append(url)
+        self.cancel_token.cancel()
+        raise OperationCancelled("Extraction cancelled.")
+
+    def _item_for(self, url: str) -> SourceItem:
+        return SourceItem(source_id=f"source:{url}", url=url, title="Cancelling Track")
+
+
+class CancellingFilesystem(RecordingFilesystem):
+    def transfer_verified(self, source: Path, headphones_folder: Path, filename: str, cancel_token=None) -> Path:
+        incomplete = headphones_folder / f"{filename}.incomplete"
+        incomplete.write_bytes(b"partial")
+        if cancel_token is not None:
+            cancel_token.cancel()
+        raise OperationCancelled("Transfer cancelled.")
+
+
+def test_run_refuses_selection_when_known_estimate_exceeds_known_free_space(artifact_dir: Path) -> None:
+    source_media = artifact_dir / "source.webm"
+    source_media.write_bytes(b"source media")
+    headphones_folder = artifact_dir / "headphones"
+    headphones_folder.mkdir()
+    url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+    extractor = RecordingExtractor(source_media, durations={url: 120.0})
+    workflow = Workflow(
+        extractor=extractor,
+        encoder=WritingEncoder(),
+        filesystem=RecordingFilesystem(free_bytes=1_000),
+        workspace=artifact_dir / "workspace",
+    )
+
+    result = workflow.run([url], headphones_folder)
+
+    assert result.ok is False
+    assert result.outcomes[0].status is TransferStatus.ERROR
+    assert "estimated to require" in result.outcomes[0].message
+    assert extractor.calls == []
+
+
+def test_selection_space_summary_reports_uncertain_duration_without_refusing(artifact_dir: Path) -> None:
+    source_media = artifact_dir / "source.webm"
+    source_media.write_bytes(b"source media")
+    headphones_folder = artifact_dir / "headphones"
+    headphones_folder.mkdir()
+    workflow = Workflow(
+        extractor=RecordingExtractor(source_media),
+        encoder=WritingEncoder(),
+        filesystem=RecordingFilesystem(free_bytes=100_000_000),
+        workspace=artifact_dir / "workspace",
+    )
+
+    summary = workflow.selection_space_summary(
+        ["https://www.youtube.com/watch?v=dQw4w9WgXcQ"],
+        headphones_folder,
+    )
+
+    assert summary.item_count == 1
+    assert summary.estimated_bytes is None
+    assert summary.free_bytes == 100_000_000
+    assert summary.unknown_size_count == 1
+    assert summary.has_uncertainty is True
+
+
+def test_cancel_before_run_stops_before_extraction(artifact_dir: Path) -> None:
+    source_media = artifact_dir / "source.webm"
+    source_media.write_bytes(b"source media")
+    headphones_folder = artifact_dir / "headphones"
+    headphones_folder.mkdir()
+    extractor = RecordingExtractor(source_media)
+    workflow = Workflow(
+        extractor=extractor,
+        encoder=WritingEncoder(),
+        filesystem=RecordingFilesystem(),
+        workspace=artifact_dir / "workspace",
+    )
+
+    result = workflow.run(
+        ["https://www.youtube.com/watch?v=dQw4w9WgXcQ"],
+        headphones_folder,
+        cancel_token=ManualCancelToken(cancelled=True),
+    )
+
+    assert result.outcomes[0].status is TransferStatus.CANCELLED
+    assert extractor.calls == []
+    assert list(headphones_folder.iterdir()) == []
+
+
+def test_cancel_during_extraction_stops_future_items_and_preserves_completed_transfers(artifact_dir: Path) -> None:
+    source_media = artifact_dir / "source.webm"
+    source_media.write_bytes(b"source media")
+    headphones_folder = artifact_dir / "headphones"
+    headphones_folder.mkdir()
+    token = ManualCancelToken()
+    first_url = "https://www.youtube.com/watch?v=first"
+    second_url = "https://www.youtube.com/watch?v=second"
+    workflow = Workflow(
+        extractor=RecordingExtractor(source_media, durations={first_url: 1.0}),
+        encoder=WritingEncoder(),
+        filesystem=RecordingFilesystem(),
+        workspace=artifact_dir / "workspace",
+    )
+
+    first = workflow.run([first_url], headphones_folder, cancel_token=token)
+    workflow.extractor = CancellingExtractor(source_media, token)
+    second = workflow.run([second_url, "https://www.youtube.com/watch?v=third"], headphones_folder, cancel_token=token)
+
+    assert first.outcomes[0].status is TransferStatus.TRANSFERRED
+    assert len(second.outcomes) == 1
+    assert second.outcomes[0].status is TransferStatus.CANCELLED
+    assert len(list(headphones_folder.glob("*.mp3"))) == 1
+
+
+def test_cancel_during_copy_leaves_no_complete_looking_partial_file(artifact_dir: Path) -> None:
+    source_media = artifact_dir / "source.webm"
+    source_media.write_bytes(b"source media")
+    headphones_folder = artifact_dir / "headphones"
+    headphones_folder.mkdir()
+    workflow = Workflow(
+        extractor=RecordingExtractor(source_media),
+        encoder=WritingEncoder(),
+        filesystem=CancellingFilesystem(),
+        workspace=artifact_dir / "workspace",
+    )
+
+    result = workflow.run(
+        ["https://www.youtube.com/watch?v=dQw4w9WgXcQ"],
+        headphones_folder,
+        cancel_token=ManualCancelToken(),
+    )
+
+    assert result.outcomes[0].status is TransferStatus.CANCELLED
+    pending = workflow.pending_transfers()[0]
+    assert (artifact_dir / "workspace" / "recovery" / pending.filename).exists()
+    assert list(headphones_folder.iterdir()) == []

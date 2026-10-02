@@ -13,6 +13,10 @@ from swimtunes.models import (
 )
 
 
+class OperationCancelled(Exception):
+    """Raised by adapters when a user cancellation interrupts work."""
+
+
 class Extractor(Protocol):
     def preview(self, url: str) -> SourcePlaylist:
         """Resolve Source Playlist metadata without downloading Source Items."""
@@ -32,6 +36,12 @@ class Encoder(Protocol):
         """Inspect an Audio File artifact."""
 
 
+class CancelToken(Protocol):
+    @property
+    def is_cancelled(self) -> bool:
+        """Return True once the user has requested cancellation."""
+
+
 class FileSystem(Protocol):
     def ensure_headphones_folder(self, folder: Path) -> None:
         """Reject absent or invalid Headphones Folders before extraction starts."""
@@ -39,8 +49,17 @@ class FileSystem(Protocol):
     def safe_audio_filename(self, title: str) -> str:
         """Return a Headphones Device-safe MP3 filename for a Source Item title."""
 
-    def transfer_verified(self, source: Path, headphones_folder: Path, filename: str) -> Path:
+    def transfer_verified(
+        self,
+        source: Path,
+        headphones_folder: Path,
+        filename: str,
+        cancel_token: CancelToken | None = None,
+    ) -> Path:
         """Copy, fsync, verify, and atomically complete a Transfer."""
+
+    def free_bytes(self, folder: Path) -> int | None:
+        """Return known writable free space for a Headphones Folder, or None if unknown."""
 
 
 class TransferStateStore(Protocol):

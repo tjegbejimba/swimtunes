@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import sys
+import inspect
 from pathlib import Path
 
-from swimtunes.app import Workflow
-from swimtunes.models import TransferStatus
+from swimtunes.app import SimpleCancelToken, Workflow
+from swimtunes.models import SelectionSpaceSummary, TransferStatus
 
 
 class MainWindow:  # populated at runtime after PySide6 import succeeds
@@ -24,6 +25,25 @@ def _build_main_window():
         QVBoxLayout,
         QWidget,
     )
+    from PySide6.QtCore import QObject, Qt, QThread, Signal
+
+    class TransferWorker(QObject):
+        progress = Signal(object)
+        finished = Signal(object)
+
+        def __init__(self, transfer, items, headphones_folder: Path, cancel_token: SimpleCancelToken) -> None:
+            super().__init__()
+            self.transfer = transfer
+            self.items = items
+            self.headphones_folder = headphones_folder
+            self.cancel_token = cancel_token
+
+        def run(self) -> None:
+            kwargs = {"on_progress": self.progress.emit}
+            if "cancel_token" in inspect.signature(self.transfer).parameters:
+                kwargs["cancel_token"] = self.cancel_token
+            result = self.transfer(self.items, self.headphones_folder, **kwargs)
+            self.finished.emit(result)
 
     class SwimTunesWindow(QMainWindow):
         def __init__(self, workflow: Workflow | None = None) -> None:
@@ -36,6 +56,9 @@ def _build_main_window():
             self.headphones_folder: Path | None = selection.path if selection else None
             self.playlist_entries = []
             self.playlist_checkboxes = []
+            self.cancel_token: SimpleCancelToken | None = None
+            self.active_thread: QThread | None = None
+            self.active_worker: TransferWorker | None = None
             self.setWindowTitle("SwimTunes")
 
             self.url_input = QTextEdit()
@@ -52,6 +75,9 @@ def _build_main_window():
             preview_button.clicked.connect(self.preview)
             self.transfer_button = QPushButton("Transfer")
             self.transfer_button.clicked.connect(self.transfer)
+            self.cancel_button = QPushButton("Cancel")
+            self.cancel_button.clicked.connect(self.cancel_transfer)
+            self.cancel_button.setEnabled(False)
             self.preview_container = QWidget()
             self.preview_layout = QVBoxLayout()
             self.preview_container.setLayout(self.preview_layout)
@@ -73,7 +99,10 @@ def _build_main_window():
             layout.addWidget(QLabel("Pending Transfers"))
             layout.addWidget(self.pending_container)
             layout.addLayout(folder_row)
-            layout.addWidget(self.transfer_button)
+            transfer_row = QHBoxLayout()
+            transfer_row.addWidget(self.transfer_button)
+            transfer_row.addWidget(self.cancel_button)
+            layout.addLayout(transfer_row)
             layout.addWidget(self.output)
             container = QWidget()
             container.setLayout(layout)
@@ -132,6 +161,27 @@ def _build_main_window():
                     return
                 transfer = self.workflow.run
 
+            summary_getter = getattr(self.workflow, "selection_space_summary", None)
+            summary = (
+                summary_getter(items, self.headphones_folder)
+                if summary_getter is not None
+                else SelectionSpaceSummary(item_count=len(items), estimated_bytes=0, free_bytes=0)
+            )
+            summary_line = self._selection_summary_text(summary)
+            if summary.known_too_large:
+                self.output.setPlainText(f"{summary_line}\nRefusing to start: selection does not fit.")
+                return
+            if summary.has_uncertainty:
+                answer = QMessageBox.warning(
+                    self,
+                    "Confirm Transfer",
+                    f"{summary_line}\nSome sizes or free space are uncertain. Continue?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                )
+                if answer != QMessageBox.StandardButton.Yes:
+                    self.output.setPlainText(f"{summary_line}\nCancelled before starting.")
+                    return
+
             lines: list[str] = []
             transferred_labels: set[str] = set()
 
@@ -145,9 +195,51 @@ def _build_main_window():
                     lines.append(f"Transferred: {label} -> {outcome.transfer_path}")
                     self.output.setPlainText("\n".join(lines))
 
-            result = transfer(items, self.headphones_folder, on_progress=record_progress)
+            lines.append(summary_line)
+            self.output.setPlainText("\n".join(lines))
+            self._start_background_transfer(transfer, items, lines, transferred_labels, record_progress)
+
+        def cancel_transfer(self) -> None:
+            if self.cancel_token is not None:
+                self.cancel_token.cancel()
+                self.cancel_button.setEnabled(False)
+                self.output.append("Cancelling…")
+
+        def _start_background_transfer(
+            self,
+            transfer,
+            items,
+            lines: list[str],
+            transferred_labels: set[str],
+            record_progress,
+        ) -> None:
+            self.cancel_token = SimpleCancelToken()
+            self.transfer_button.setEnabled(False)
+            self.cancel_button.setEnabled(True)
+            thread = QThread(self)
+            worker = TransferWorker(transfer, items, self.headphones_folder, self.cancel_token)
+            worker.moveToThread(thread)
+            thread.started.connect(worker.run)
+            worker.progress.connect(record_progress, Qt.ConnectionType.QueuedConnection)
+            worker.finished.connect(
+                lambda result: self._finish_background_transfer(result, lines, transferred_labels),
+                Qt.ConnectionType.QueuedConnection,
+            )
+            worker.finished.connect(thread.quit)
+            worker.finished.connect(worker.deleteLater)
+            thread.finished.connect(thread.deleteLater)
+            self.active_thread = thread
+            self.active_worker = worker
+            thread.start()
+
+        def _finish_background_transfer(self, result, lines: list[str], transferred_labels: set[str]) -> None:
             self._append_final_outcomes(result.outcomes, lines, transferred_labels)
             self.output.setPlainText("\n".join(lines))
+            self.transfer_button.setEnabled(True)
+            self.cancel_button.setEnabled(False)
+            self.cancel_token = None
+            self.active_worker = None
+            self.active_thread = None
             self._refresh_pending_transfers()
 
         def _clear_playlist_preview(self) -> None:
@@ -236,6 +328,24 @@ def _build_main_window():
                 lines.append(f"Transferred: {label} -> {outcome.transfer_path}")
                 self.output.setPlainText("\n".join(lines))
 
+        def _selection_summary_text(self, summary: SelectionSpaceSummary) -> str:
+            size = (
+                f"{summary.estimated_bytes} bytes estimated"
+                if summary.estimated_bytes is not None
+                else "estimated size uncertain"
+            )
+            free = (
+                f"{summary.free_bytes} bytes available"
+                if summary.free_bytes is not None
+                else "available space uncertain"
+            )
+            unknown = (
+                f"; {summary.unknown_size_count} Source Item size(s) uncertain"
+                if summary.unknown_size_count
+                else ""
+            )
+            return f"Selection: {summary.item_count} Source Item(s), {size}, {free}{unknown}."
+
         def _append_final_outcomes(self, outcomes, lines: list[str], transferred_labels: set[str]) -> None:
             for outcome in outcomes:
                 label = outcome.title or outcome.source_url or "Source Item"
@@ -246,6 +356,8 @@ def _build_main_window():
                     lines.append(f"Already present: {label} -> {outcome.transfer_path}")
                 elif outcome.status is TransferStatus.REPAIR_NEEDED:
                     lines.append(f"Repair needed: {label}: {outcome.message}")
+                elif outcome.status is TransferStatus.CANCELLED:
+                    lines.append(f"Cancelled: {label}: {outcome.message}")
                 else:
                     lines.append(f"Error: {label}: {outcome.message}")
 

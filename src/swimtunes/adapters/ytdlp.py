@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from swimtunes.models import SourceItem, SourcePlaylist, SourcePlaylistEntry
+from swimtunes.ports import CancelToken, OperationCancelled
 
 
 class YtDlpExtractor:
@@ -35,6 +36,7 @@ class YtDlpExtractor:
                     title=title,
                     available=error is None,
                     error=error,
+                    duration_seconds=self._duration_seconds(entry),
                 )
             )
         return SourcePlaylist(
@@ -58,8 +60,17 @@ class YtDlpExtractor:
                 raise ValueError("Extractor returned no Source Item metadata.")
         return self._source_item(info, url)
 
-    def extract(self, url: str, work_dir: Path) -> tuple[SourceItem, Path]:
+    def extract(
+        self,
+        url: str,
+        work_dir: Path,
+        cancel_token: CancelToken | None = None,
+    ) -> tuple[SourceItem, Path]:
         import yt_dlp
+
+        def stop_if_cancelled(_status: dict) -> None:
+            if cancel_token is not None and cancel_token.is_cancelled:
+                raise OperationCancelled("Extraction cancelled.")
 
         work_dir.mkdir(parents=True, exist_ok=True)
         options = {
@@ -68,7 +79,10 @@ class YtDlpExtractor:
             "outtmpl": str(work_dir / "%(extractor)s-%(id)s.%(ext)s"),
             "quiet": True,
             "no_warnings": True,
+            "progress_hooks": [stop_if_cancelled],
         }
+        if cancel_token is not None and cancel_token.is_cancelled:
+            raise OperationCancelled("Extraction cancelled.")
         with yt_dlp.YoutubeDL(options) as downloader:
             info = downloader.extract_info(url, download=True)
             if info is None:
@@ -80,7 +94,14 @@ class YtDlpExtractor:
     def _source_item(self, info: dict, url: str) -> SourceItem:
         source_id = f"{info.get('extractor_key') or info.get('extractor') or 'source'}:{info.get('id') or url}"
         title = str(info.get("title") or info.get("id") or "Audio File")
-        return SourceItem(source_id=source_id, url=url, title=title)
+        return SourceItem(source_id=source_id, url=url, title=title, duration_seconds=self._duration_seconds(info))
+
+    def _duration_seconds(self, info: dict) -> float | None:
+        duration = info.get("duration")
+        try:
+            return float(duration) if duration is not None else None
+        except (TypeError, ValueError):
+            return None
 
     def _entry_url(self, entry: dict) -> str:
         webpage_url = entry.get("webpage_url")

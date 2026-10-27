@@ -29,8 +29,14 @@ jobs:
         with:
           enable-cache: true
       - uses: actions/setup-python@v5
+        if: runner.environment == 'github-hosted'
         with:
           python-version: '3.12'
+      - name: Use uv-managed Python 3.12 (self-hosted)
+        if: runner.environment == 'self-hosted'
+        run: |
+          echo "UV_PYTHON=3.12" >> "$GITHUB_ENV"
+          echo "UV_PYTHON_INSTALL_DIR=$RUNNER_TOOL_CACHE/uv-python" >> "$GITHUB_ENV"
       - name: Install FFmpeg for media-shape tests (macOS)
         if: runner.os == 'macOS'
         run: command -v ffmpeg >/dev/null || brew install ffmpeg

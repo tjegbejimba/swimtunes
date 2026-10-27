@@ -14,11 +14,15 @@ on:
 jobs:
   tests:
     name: Tests (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, windows-latest]
+        include:
+          - os: macos
+            runner: ${{ vars.SWIMTUNES_MAC_RUNNER || 'macos-latest' }}
+          - os: windows
+            runner: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
@@ -29,7 +33,12 @@ jobs:
           python-version: '3.12'
       - name: Install FFmpeg for media-shape tests (macOS)
         if: runner.os == 'macOS'
-        run: brew install ffmpeg
+        run: command -v ffmpeg >/dev/null || brew install ffmpeg
+      - name: Isolate the user home directory (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          mkdir -p "$RUNNER_TEMP/home"
+          echo "HOME=$RUNNER_TEMP/home" >> "$GITHUB_ENV"
       - name: Install FFmpeg for media-shape tests (Windows)
         if: runner.os == 'Windows'
         shell: pwsh

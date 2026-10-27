@@ -14,22 +14,37 @@ on:
 jobs:
   tests:
     name: Tests (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, windows-latest]
+        include:
+          - os: macos
+            runner: ${{ vars.SWIMTUNES_MAC_RUNNER || 'macos-latest' }}
+          - os: windows
+            runner: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
       - uses: actions/setup-python@v5
+        if: runner.environment == 'github-hosted'
         with:
           python-version: '3.12'
+      - name: Use uv-managed Python 3.12 (self-hosted)
+        if: runner.environment == 'self-hosted'
+        run: |
+          echo "UV_PYTHON=3.12" >> "$GITHUB_ENV"
+          echo "UV_PYTHON_INSTALL_DIR=$RUNNER_TOOL_CACHE/uv-python" >> "$GITHUB_ENV"
       - name: Install FFmpeg for media-shape tests (macOS)
         if: runner.os == 'macOS'
-        run: brew install ffmpeg
+        run: command -v ffmpeg >/dev/null || brew install ffmpeg
+      - name: Isolate the user home directory (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          mkdir -p "$RUNNER_TEMP/home"
+          echo "HOME=$RUNNER_TEMP/home" >> "$GITHUB_ENV"
       - name: Install FFmpeg for media-shape tests (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
